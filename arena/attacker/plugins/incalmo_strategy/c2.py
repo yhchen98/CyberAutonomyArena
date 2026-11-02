@@ -166,32 +166,33 @@ def setup_c2(experiment_name: str, cfg, access: AttackerSetupAccess, bastion_ip:
             f"[foothold-c2] docker install on foothold {foothold_ip} failed after 5 tries; "
             f"last rc!=0 output: {_last or '(none captured)'}")
 
-    # 3. Ship the image (docker save | gzip | ssh 'gunzip | docker load').
+    # 3. Remove the old per-experiment container/image, then ship the image
+    #    (docker save | gzip | ssh 'gunzip | docker load'). The image is the only source of C2 code.
+    logger.info("[foothold-c2] removing old C2 container/image on foothold")
+    subprocess.run(ssh + ["docker rm -f c2 >/dev/null 2>&1 || true"], check=True, timeout=120)
+    old = subprocess.run(ssh + ["docker rmi incalmo/c2c:latest"], capture_output=True, text=True, timeout=120)
+    if old.returncode != 0 and "No such image" not in (old.stderr + old.stdout):
+        logger.warning("[foothold-c2] old C2 image removal on %s: %s", foothold_ip,
+                       (old.stderr or old.stdout).strip()[:300])
+
     logger.info("[foothold-c2] shipping %s to foothold", _C2C_IMAGE)
     save = subprocess.Popen(["docker", "save", _C2C_IMAGE], stdout=subprocess.PIPE)
     gz = subprocess.Popen(["gzip", "-1"], stdin=save.stdout, stdout=subprocess.PIPE)
     subprocess.run(ssh + ["gunzip | docker load"], stdin=gz.stdout, check=True, timeout=900)
     save.wait(); gz.wait()
 
-    # 4. Ship /incalmo plus the C2's payloads dir, but exclude the generated dynamic_payload_*.sh files
-    #    (stale cross-run payloads). Keep the rest of the dir — it holds the agent-deploy tooling.
-    incalmo_dir = Path(incalmo_dir)
-    tar = subprocess.Popen(
-        ["tar", "czf", "-", "--exclude=.git", "--exclude=.venv", "--exclude=.venv-c2c",
-         "--exclude=incalmo/frontend", "--exclude=output", "--exclude=__pycache__",
-         "--exclude=.env", "--exclude=.env.*",
-         "--exclude=incalmo/c2server/payloads/dynamic_payload_*.sh",
-         "-C", str(incalmo_dir.parent), incalmo_dir.name], stdout=subprocess.PIPE)
+    # 4. Run the C2 container on the foothold, bound to 8888 on all interfaces (in-tenant reachable).
     subprocess.run(ssh + [
-        "rm -rf /incalmo && mkdir -p /incalmo && tar xzf - -C /incalmo --strip-components=1"],
-        stdin=tar.stdout, check=True, timeout=900)
-    tar.wait()
-
-    # 5. Run the C2 container on the foothold, bound to 8888 on all interfaces (in-tenant reachable).
-    subprocess.run(ssh + [
-        f"docker rm -f c2 >/dev/null 2>&1; docker run -d --name c2 -p 0.0.0.0:{_C2_PORT}:{_C2_PORT} "
-        f"-v /incalmo:/incalmo {_C2C_IMAGE}"],
+        f"docker run -d --name c2 --network host {_C2C_IMAGE}"],
         check=True, timeout=180)
+    # The foothold may ship a default-deny host firewall; the victim-side agent
+    # download uses the C2 port directly, so admit it before the tunnel check.
+    subprocess.run(ssh + [
+        f"iptables -w 5 -C INPUT -p tcp --dport {_C2_PORT} "
+        "-m comment --comment arena-incalmo-c2 -j ACCEPT 2>/dev/null || "
+        f"iptables -w 5 -I INPUT 1 -p tcp --dport {_C2_PORT} "
+        "-m comment --comment arena-incalmo-c2 -j ACCEPT"],
+        check=True, timeout=60)
 
     # Setup done. Close the shared master. The tunnel below is its own long-lived connection.
     _close_master(access, ctl)
@@ -274,7 +275,12 @@ def teardown_c2(experiment_name: str, cfg=None) -> None:
         try:
             access = AttackerSetupAccess.model_validate(acc)
             ssh = _ssh_to_foothold(access)
-            subprocess.run(ssh + ["docker rm -f c2 >/dev/null 2>&1 || true"],
+            subprocess.run(ssh + [
+                "docker rm -f c2 >/dev/null 2>&1 || true; "
+                f"if iptables -w 5 -C INPUT -p tcp --dport {_C2_PORT} "
+                "-m comment --comment arena-incalmo-c2 -j ACCEPT 2>/dev/null; then "
+                f"iptables -w 5 -D INPUT -p tcp --dport {_C2_PORT} "
+                "-m comment --comment arena-incalmo-c2 -j ACCEPT; fi"],
                            timeout=120, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as e:
             logger.warning("[foothold-c2] teardown docker rm on foothold %s: %s", state.get("foothold_ip"), e)
