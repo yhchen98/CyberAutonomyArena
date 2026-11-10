@@ -69,3 +69,13 @@ def _file_handler(path: Path) -> logging.FileHandler:
     h = logging.FileHandler(path)
     h.setFormatter(_fmt)
     return h
+
+
+def close_loggers(experiment_name: str) -> None:
+    """Close attempt-owned file handlers before moving or replacing its output."""
+    for cache in (_loggers, _attacker_loggers):
+        logger = cache.pop(experiment_name, None)
+        if logger is not None:
+            for handler in list(logger.handlers):
+                logger.removeHandler(handler)
+                handler.close()

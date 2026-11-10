@@ -234,6 +234,7 @@ main { padding: 18px 20px 40px; max-width: 1500px; margin: 0 auto; }
 .st-Retrying     { --bfg: var(--st-retry-fg);   --bbg: var(--st-retry-bg); }
 .st-Error        { --bfg: var(--st-error-fg);   --bbg: var(--st-error-bg); }
 .st-Finished     { --bfg: var(--st-done-fg);    --bbg: var(--st-done-bg); }
+.st-ExperimentTimedOut,
 .st-TimedOut     { --bfg: var(--st-timeout-fg); --bbg: var(--st-timeout-bg); }
 .st-Blocked      { --bfg: var(--st-blocked-fg); --bbg: var(--st-blocked-bg); }
 

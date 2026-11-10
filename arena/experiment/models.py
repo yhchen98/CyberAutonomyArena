@@ -45,6 +45,7 @@ class ExperimentStatus(str, Enum):
     CONFIGURED = "Configured"
     RUNNING = "Running"
     RETRYING = "Retrying"
+    CANCELLED = "Cancelled"
     ERROR = "Error"
     FINISHED = "Finished"
     TIMEDOUT = "TimedOut"
@@ -200,6 +201,14 @@ class Experiment:
                 "stopping_at": None, "stopped_at": None,
             },
         }
+
+    def reset_attempt(self) -> None:
+        """Clear runtime fields after archiving, preserving the submitted configuration."""
+        for group in ("environment", "attacker", "defender"):
+            for key in self.metadata[group]:
+                if key not in _CONFIG_KEYS[group]:
+                    self.metadata[group][key] = None
+        self.metadata.pop("runtime", None)
 
     @property
     def environment(self):

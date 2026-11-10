@@ -10,6 +10,7 @@ import shlex
 import signal
 import socket
 import subprocess
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 _C2C_IMAGE = "incalmo/c2c:latest"
 _C2_PORT = 8888
 _STATE_DIR = Path("/tmp") / getpass.getuser() / "foothold-c2"  # per-user: /tmp is shared
-_built = False
+_built_image: str | None = None
 
 # Async-interface tunables for readiness and first-beacon polling over the local ssh -L tunnel.
 STARTUP_TIMEOUT = 60
@@ -77,18 +78,21 @@ def _close_master(access: AttackerSetupAccess, ctl: str) -> None:
         pass
 
 
-def _ensure_image_built_sync(cfg, incalmo_dir) -> None:
-    """Build incalmo/c2c on the harness host once per process, so setup can ship it to the foothold."""
-    global _built
-    if _built:
-        return
-    logger.info("[foothold-c2] building C2 image %s on the harness host", _C2C_IMAGE)
-    subprocess.run(
-        ["docker", "build", "-t", _C2C_IMAGE, "-f", "docker/c2server/Dockerfile", "."],
-        cwd=str(incalmo_dir), check=True,
-        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=1800,
-    )
-    _built = True
+def _ensure_image_built_sync(cfg, incalmo_dir) -> str:
+    """Build once and retain the immutable image ID, even if another build moves the tag."""
+    global _built_image
+    if _built_image is None:
+        logger.info("[foothold-c2] building C2 image %s on the harness host", _C2C_IMAGE)
+        with tempfile.TemporaryDirectory(prefix="arena-c2-image-") as directory:
+            iidfile = Path(directory) / "image.id"
+            subprocess.run(
+                ["docker", "build", "-t", _C2C_IMAGE, "--iidfile", str(iidfile),
+                 "-f", "docker/c2server/Dockerfile", "."],
+                cwd=str(incalmo_dir), check=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=1800,
+            )
+            _built_image = iidfile.read_text().strip()
+    return _built_image
 
 
 def _free_local_port() -> int:
@@ -112,7 +116,8 @@ def setup_c2(experiment_name: str, cfg, access: AttackerSetupAccess, bastion_ip:
     # Reap a stale master from a prior attempt of this experiment before reusing the path.
     _close_master(access, ctl)
 
-    _ensure_image_built_sync(cfg, incalmo_dir)
+    image_id = _ensure_image_built_sync(cfg, incalmo_dir)
+    log(experiment_name, f"C2 image selected for shipment: {image_id}")
 
     # 1. Wait for the foothold to be SSH-reachable through the bastion, using a plain (non-multiplexed) ssh.
     last_err = ""
@@ -175,16 +180,17 @@ def setup_c2(experiment_name: str, cfg, access: AttackerSetupAccess, bastion_ip:
         logger.warning("[foothold-c2] old C2 image removal on %s: %s", foothold_ip,
                        (old.stderr or old.stdout).strip()[:300])
 
-    logger.info("[foothold-c2] shipping %s to foothold", _C2C_IMAGE)
-    save = subprocess.Popen(["docker", "save", _C2C_IMAGE], stdout=subprocess.PIPE)
+    logger.info("[foothold-c2] shipping %s to foothold", image_id)
+    save = subprocess.Popen(["docker", "save", image_id], stdout=subprocess.PIPE)
     gz = subprocess.Popen(["gzip", "-1"], stdin=save.stdout, stdout=subprocess.PIPE)
     subprocess.run(ssh + ["gunzip | docker load"], stdin=gz.stdout, check=True, timeout=900)
     save.wait(); gz.wait()
 
     # 4. Run the C2 container on the foothold, bound to 8888 on all interfaces (in-tenant reachable).
     subprocess.run(ssh + [
-        f"docker run -d --name c2 --network host {_C2C_IMAGE}"],
+        f"docker run -d --name c2 --network host {image_id}"],
         check=True, timeout=180)
+    log(experiment_name, f"C2 container started from image: {image_id}")
     # The foothold may ship a default-deny host firewall; the victim-side agent
     # download uses the C2 port directly, so admit it before the tunnel check.
     subprocess.run(ssh + [
