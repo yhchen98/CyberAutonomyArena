@@ -39,7 +39,7 @@ Terminal states are `Finished`, `Error`, `TimedOut` (attacker cap), `ExperimentT
 
 ## Attempt records
 
-Each attempt writes its submission to `experiment/experiment_config.json` and its outcome to `experiment/experiment_result.json`. The result also identifies the manager source at import, external source checkouts at attempt start, and the scenario file digest. A dirty checkout is recorded as such; these identifiers do not capture its uncommitted contents. The Incalmo attacker log records the immutable C2 image ID selected and started, which can differ from the current source checkout when an image is cached.
+Each attempt writes its submission to `experiment/experiment_config.json` and its outcome to `experiment/experiment_result.json`. The result also identifies the manager source at import, external source checkouts at attempt start, and the scenario file digest. A dirty checkout is recorded as such; these identifiers do not capture its uncommitted contents. The Incalmo attacker log records the selected source image ID and the image ID loaded and started on the foothold. Docker image stores can assign different IDs to the same transferred image. A cached image may also differ from the current source checkout.
 
 A failed attempt is marked `Error` before its output moves to `failed/<name>_<retry_count>`. An existing archive is retained, with a timestamp suffix on the new archive. A retry starts with fresh logs and runtime fields under the original name; its manager state is `Retrying` until it begins deployment. Retries require successful environment teardown and archiving. Explicit cancellation of an active experiment records `Cancelled` before removing the experiment from the live registry; cleanup failure records `Error`.
 

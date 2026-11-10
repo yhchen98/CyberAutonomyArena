@@ -16,6 +16,7 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
+from ..incalmo_image import start_c2_image
 from ...env_spec import AttackerSetupAccess
 from ....config import ExperimentManagerConfig
 from ....experiment_log import attacker_log as log, init_attacker_logger as init_logger, output_root
@@ -159,16 +160,7 @@ def setup_c2(experiment_name: str, cfg, access: AttackerSetupAccess, bastion_ip:
         logger.warning("[foothold-c2] old C2 image removal on %s: %s", foothold_ip,
                        (old.stderr or old.stdout).strip()[:300])
 
-    logger.info("[foothold-c2] shipping %s to foothold", image_id)
-    save = subprocess.Popen(["docker", "save", image_id], stdout=subprocess.PIPE)
-    gz = subprocess.Popen(["gzip", "-1"], stdin=save.stdout, stdout=subprocess.PIPE)
-    subprocess.run(ssh + ["gunzip | docker load"], stdin=gz.stdout, check=True, timeout=900)
-    save.wait(); gz.wait()
-
-    subprocess.run(ssh + [
-        f"docker run -d --name c2 --network host {image_id}"],
-        check=True, timeout=180)
-    log(experiment_name, f"C2 container started from image: {image_id}")
+    start_c2_image(experiment_name, image_id, ssh)
     # The foothold may ship a default-deny host firewall; the victim-side agent
     # download uses the C2 port directly, so admit it before the tunnel check.
     subprocess.run(ssh + [

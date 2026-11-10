@@ -16,6 +16,7 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
+from ..incalmo_image import start_c2_image
 from ...env_spec import AttackerSetupAccess
 from ....config import ExperimentManagerConfig
 from ....experiment_log import attacker_log as log, init_attacker_logger as init_logger, output_root
@@ -171,8 +172,7 @@ def setup_c2(experiment_name: str, cfg, access: AttackerSetupAccess, bastion_ip:
             f"[foothold-c2] docker install on foothold {foothold_ip} failed after 5 tries; "
             f"last rc!=0 output: {_last or '(none captured)'}")
 
-    # 3. Remove the old per-experiment container/image, then ship the image
-    #    (docker save | gzip | ssh 'gunzip | docker load'). The image is the only source of C2 code.
+    # 3. Replace the old C2 container/image. The image is the only source of C2 code.
     logger.info("[foothold-c2] removing old C2 container/image on foothold")
     subprocess.run(ssh + ["docker rm -f c2 >/dev/null 2>&1 || true"], check=True, timeout=120)
     old = subprocess.run(ssh + ["docker rmi incalmo/c2c:latest"], capture_output=True, text=True, timeout=120)
@@ -180,17 +180,7 @@ def setup_c2(experiment_name: str, cfg, access: AttackerSetupAccess, bastion_ip:
         logger.warning("[foothold-c2] old C2 image removal on %s: %s", foothold_ip,
                        (old.stderr or old.stdout).strip()[:300])
 
-    logger.info("[foothold-c2] shipping %s to foothold", image_id)
-    save = subprocess.Popen(["docker", "save", image_id], stdout=subprocess.PIPE)
-    gz = subprocess.Popen(["gzip", "-1"], stdin=save.stdout, stdout=subprocess.PIPE)
-    subprocess.run(ssh + ["gunzip | docker load"], stdin=gz.stdout, check=True, timeout=900)
-    save.wait(); gz.wait()
-
-    # 4. Run the C2 container on the foothold, bound to 8888 on all interfaces (in-tenant reachable).
-    subprocess.run(ssh + [
-        f"docker run -d --name c2 --network host {image_id}"],
-        check=True, timeout=180)
-    log(experiment_name, f"C2 container started from image: {image_id}")
+    start_c2_image(experiment_name, image_id, ssh)
     # The foothold may ship a default-deny host firewall; the victim-side agent
     # download uses the C2 port directly, so admit it before the tunnel check.
     subprocess.run(ssh + [
