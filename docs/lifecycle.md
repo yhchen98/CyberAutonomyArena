@@ -35,9 +35,13 @@ one piece of cross-system timing that matters: the defender-readiness handshake.
    stray-VM cleanup (e.g. sweeping decoy VMs before the network teardown) is the environment's job, done
    as the first step of its own teardown.
 
-Terminal states: `Finished`, `Error`, `TimedOut`, `Blocked`. The environment emits its own signal stream
-(`DEPLOYING/DEPLOYED/CONFIGURING/CONFIGURED/TEARING_DOWN/TORN_DOWN` + failed-with-reason) so the arena can
-track and surface per-stage status.
+Terminal states are `Finished`, `Error`, `TimedOut` (attacker cap), `ExperimentTimedOut` (overall cap), `Blocked`, and `Cancelled`. `Finished` means the attacker process exited successfully; it does not establish that the attack objective was achieved. The environment records its own lifecycle signals independently of the experiment outcome.
+
+## Attempt records
+
+Each attempt writes its submission to `experiment/experiment_config.json` and its outcome to `experiment/experiment_result.json`. The result also identifies the manager source at import, external source checkouts at attempt start, and the scenario file digest. A dirty checkout is recorded as such; these identifiers do not capture its uncommitted contents. The Incalmo attacker log records the immutable C2 image ID selected and started, which can differ from the current source checkout when an image is cached.
+
+A failed attempt is marked `Error` before its output moves to `failed/<name>_<retry_count>`. An existing archive is retained, with a timestamp suffix on the new archive. A retry starts with fresh logs and runtime fields under the original name; its manager state is `Retrying` until it begins deployment. Retries require successful environment teardown and archiving. Explicit cancellation of an active experiment records `Cancelled` before removing the experiment from the live registry; cleanup failure records `Error`.
 
 ## Defender readiness — armed in `setup()`
 

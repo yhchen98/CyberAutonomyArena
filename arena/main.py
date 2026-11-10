@@ -7,6 +7,7 @@ import shutil
 import signal
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -19,6 +20,7 @@ from .attacker.lifecycle import (
 from .defender.lifecycle import (
     DefenderLifecycle, DefenderSignal, DefenderCommand, signal_recorder as _defender_signal_recorder,
 )
+from .provenance import record_provenance, source_revision
 
 
 async def _stop_defender_process(experiment, process, cfg) -> None:
@@ -34,7 +36,7 @@ from .environment.lifecycle import signal_recorder as _env_signal_recorder
 from .environment.capacity import CapacityTracker
 from .config import ExperimentManagerConfig
 from .experiment import Experiment, ExperimentSpecs, ExperimentStatus, Registry
-from .experiment_log import get_logger, init_logger, log, output_root, register_output_root
+from .experiment_log import close_loggers, get_logger, init_logger, log, output_root, register_output_root
 
 
 def _env_lc(experiment, command: EnvironmentCommand = None) -> EnvironmentLifecycle:
@@ -56,6 +58,8 @@ def _env_lc(experiment, command: EnvironmentCommand = None) -> EnvironmentLifecy
     return lc
 
 logger = logging.getLogger(__name__)
+_MANAGER_SOURCE = source_revision(Path(__file__).parent.parent)
+_MANAGER_STARTED_AT = datetime.now(timezone.utc).isoformat()
 
 
 class _PriorityLock:
@@ -132,27 +136,26 @@ async def _wait_attacker(process, pid, timeout, exp_log, name):
     loop = asyncio.get_running_loop()
     start = loop.time()
     waiter = asyncio.ensure_future(process.wait())
-    while True:
-        done, _ = await asyncio.wait({waiter}, timeout=120.0)
-        if waiter in done:
-            return waiter.result(), False
-        if pid:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                waiter.cancel()
-                rc = process.returncode
-                if rc is None:
-                    exp_log.info(
-                        "[%s] Attacker pid %s already exited but process.wait() never "
-                        "resolved — treating as a clean finish", name, pid,
-                    )
-                    rc = 0
-                return rc, False
-            except PermissionError:
-                pass  # the process exists but we cannot signal it. It still runs
-        if timeout is not None and (loop.time() - start) >= timeout:
-            return None, True
+    try:
+        while True:
+            remaining = None if timeout is None else max(0, timeout - (loop.time() - start))
+            done, _ = await asyncio.wait({waiter}, timeout=min(120.0, remaining) if remaining is not None else 120.0)
+            if waiter in done:
+                return waiter.result(), False
+            if pid:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    if process.returncode is None:
+                        raise RuntimeError(f"Attacker pid {pid} disappeared; exit status is unknown")
+                    return process.returncode, False
+                except PermissionError:
+                    pass  # the process exists but we cannot signal it
+            if timeout is not None and (loop.time() - start) >= timeout:
+                return None, True
+    finally:
+        if not waiter.done():
+            waiter.cancel()
 
 
 _ACTIVE_STATUSES = {  # non-terminal statuses. Their C2 must survive other experiment runs
@@ -253,7 +256,12 @@ async def _pgrep_f(pattern: str) -> list[int]:
 
 
 async def _clean_slate() -> None:
-    """On startup, kill all running processes, stop C2 containers, tear down environments."""
+    """Stop lifecycle tasks before cleaning processes, C2 containers and environments."""
+    tasks = tuple(_tasks.values())
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    _tasks.clear()
     # Reap leftover MHBench/ansible subprocesses from a prior harness. Skip the GCP manager's tree.
     for pattern in ("MHBench/cli.py", "ansible"):
         try:
@@ -330,6 +338,12 @@ async def _clean_slate() -> None:
 
     for experiment in experiments:
         try:
+            if experiment.status in _ACTIVE_STATUSES:
+                experiment.status = ExperimentStatus.CANCELLED
+                experiment.error = "Cancelled by manager clean-slate"
+                await registry.update(experiment)
+                _write_result(experiment)
+            close_loggers(experiment.experiment_name)
             await registry.remove(experiment.experiment_name)
         except Exception:
             logger.exception("Failed to remove '%s' from registry", experiment.experiment_name)
@@ -415,44 +429,48 @@ def _write_result(experiment: Experiment) -> None:
 
 
 async def _handle_failure(experiment: Experiment, reason: Optional[str] = None) -> None:
-    """Tear down a failed attempt, then retry in place as RETRYING until the budget is spent, else ERROR."""
+    """Record and archive the failed attempt before starting a clean retry."""
     name = experiment.experiment_name
     if reason:
         experiment.error = reason
     tore_down = await _teardown(experiment)
+    experiment.status = ExperimentStatus.ERROR
+    await registry.update(experiment)
     _write_result(experiment)
 
-    # Archive this attempt's output so the retry starts clean and each try stays inspectable.
     src = output_root(name, cfg) / name
     if src.exists():
         dst = output_root(name, cfg) / "failed" / f"{name}_{experiment.retry_count}"
-        dst.parent.mkdir(parents=True, exist_ok=True)
         if dst.exists():
-            shutil.rmtree(str(dst))
-        await asyncio.get_event_loop().run_in_executor(None, shutil.move, str(src), str(dst))
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+            dst = dst.with_name(f"{dst.name}_{stamp}")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        get_logger(name).info("Archiving failed attempt to %s", dst)
+        close_loggers(name)
+        try:
+            src.rename(dst)
+        except Exception as exc:
+            init_logger(name, output_root(name, cfg)).exception("Failed to archive attempt; not retrying")
+            experiment.error = f"{experiment.error}; archive failed: {exc}"
+            await registry.update(experiment)
+            _write_result(experiment)
+            return
 
-    # Retry only over a cleanly torn-down env, never redeploy on top of a half-destroyed one.
+    # Never redeploy on top of a half-destroyed or deliberately preserved environment.
     if tore_down and cfg.max_retries > 0 and experiment.retry_count < cfg.max_retries:
         experiment.retry_count += 1
+        experiment.reset_attempt()
         experiment.status = ExperimentStatus.RETRYING
         experiment.error = None
-        experiment.deployed_environment = experiment.pid = None
-        # Clearing the reservations un-holds the failed attempt's VMs in the CapacityTracker.
-        experiment.vcpus_reserved = experiment.ram_mb_reserved = None
-        experiment.disk_gb_reserved = experiment.vms_reserved = None
-        for f in ("environment_deploy_started_at", "environment_deploy_finished_at",
-                  "defender_started_at", "defender_finished_at", "attacker_started_at",
-                  "attacker_finished_at", "teardown_started_at", "teardown_finished_at"):
-            setattr(experiment, f, None)
         await registry.update(experiment)
-        get_logger(name).info("[%s] Attempt failed — retry %d/%d (harness-handled)",
-                              name, experiment.retry_count, cfg.max_retries)
+        init_logger(name, output_root(name, cfg)).info(
+            "[%s] Attempt failed — retry %d/%d (harness-handled)",
+            name, experiment.retry_count, cfg.max_retries)
+        _write_result(experiment)
         _tasks[name] = asyncio.create_task(_run_experiment_gated(experiment))
     else:
-        experiment.status = ExperimentStatus.ERROR
-        await registry.update(experiment)
-        reason = "teardown failed, not retrying" if not tore_down else f"failed after {experiment.retry_count} retries"
-        get_logger(name).warning("[%s] Escalating ERROR — %s", name, reason)
+        reason = "environment not torn down; not retrying" if not tore_down else f"failed after {experiment.retry_count} retries"
+        logger.warning("[%s] Escalating ERROR — %s", name, reason)
 
 
 async def _cancel_and_remove(name: str) -> None:
@@ -468,32 +486,43 @@ async def _cancel_and_remove(name: str) -> None:
         experiment = registry.get(name)
     except KeyError:
         return
+    cleanup_failed = False
     try:  # kill only this experiment's subprocess (every stage tags --project-name)
         proc = await asyncio.create_subprocess_exec(
             "pkill", "-9", "-f", f"cli.py.*--project-name {name}( |$)",
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
         await proc.wait()
     except Exception:
+        cleanup_failed = True
         logger.exception("Failed to kill MHBench subprocess for '%s'", name)
     if experiment.attacker:
         try:
             await experiment.attacker.stop(experiment, cfg)
         except Exception:
+            cleanup_failed = True
             logger.exception("Failed to stop attacker process for '%s'", name)
         try:
             await experiment.attacker.teardown(experiment.experiment_name, cfg)
         except Exception:
+            cleanup_failed = True
             logger.exception("Failed to stop C2 for '%s'", name)
     if experiment.defender:
         try:
             await experiment.defender.teardown(experiment.experiment_name, cfg)
         except Exception:
+            cleanup_failed = True
             logger.exception("Defender teardown failed for '%s'", name)
     try:
         await experiment.environment.teardown(experiment, cfg, lc=_env_lc(experiment, EnvironmentCommand.TEARDOWN))
     except Exception:
+        cleanup_failed = True
         logger.exception("Failed to tear down environment for '%s'", name)
-    # This path never sets teardown_finished_at, so the registry removal is what frees the VM hold.
+    if experiment.status in _ACTIVE_STATUSES:
+        experiment.status = ExperimentStatus.ERROR if cleanup_failed else ExperimentStatus.CANCELLED
+        experiment.error = "Cancellation cleanup failed; see manager log" if cleanup_failed else "Cancelled by manager"
+        await registry.update(experiment)
+        _write_result(experiment)
+    close_loggers(name)
     await registry.remove(name)
     _capacity.release(name)
 
@@ -523,17 +552,24 @@ async def _docker_preflight() -> Optional[str]:
 
 
 async def _run_experiment_gated(experiment: Experiment) -> None:
-    """Run an experiment under the active-concurrency cap, priority-ordered, releasing the slot on every exit."""
+    """Run under the active cap, recording lifecycle failures and the overall timeout."""
     async with _inflight_gate.acquire(_gate_priority(experiment)):
         timeout = getattr(cfg, "experiment_timeout_seconds", None)
-        if not timeout:
-            await _run_experiment(experiment)
-            return
-        # Overall wall-clock backstop: bound the whole lifecycle so a total hang can't run forever.
+        deadline = None
         try:
-            await asyncio.wait_for(_run_experiment(experiment), timeout)
-        except asyncio.TimeoutError:
-            await _handle_experiment_timeout(experiment)
+            if timeout:
+                async with asyncio.timeout(timeout) as deadline:
+                    await _run_experiment(experiment)
+            else:
+                await _run_experiment(experiment)
+        except TimeoutError as exc:
+            if deadline is not None and deadline.expired():
+                await _handle_experiment_timeout(experiment)
+            else:
+                await _handle_failure(experiment, f"Experiment lifecycle failed — {exc}")
+        except Exception as exc:
+            get_logger(experiment.experiment_name).exception("Unexpected experiment lifecycle failure")
+            await _handle_failure(experiment, f"Experiment lifecycle failed — {exc}")
 
 
 async def _handle_experiment_timeout(experiment: Experiment) -> None:
@@ -581,6 +617,11 @@ async def _run_experiment(experiment: Experiment) -> None:
     config_path = output_root(name, cfg) / name / "experiment" / "experiment_config.json"
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(experiment.config_json())
+    experiment.metadata["runtime"] = {
+        "manager": {"pid": os.getpid(), "started_at": _MANAGER_STARTED_AT, "source_at_import": _MANAGER_SOURCE},
+        **record_provenance(experiment, cfg),
+    }
+    _write_result(experiment)
 
     # Fail fast if this attacker needs Docker and it is not usable.
     if experiment.attacker is not None and getattr(experiment.attacker, "requires_docker", False):
@@ -832,7 +873,10 @@ async def _run_experiment(experiment: Experiment) -> None:
         return
 
     # Flip to a terminal status only after _teardown, which collects all host telemetry before deleting VMs.
-    await _teardown(experiment)
+    tore_down = await _teardown(experiment)
+    if experiment.teardown and not tore_down:
+        experiment.error = f"Environment teardown failed after attacker outcome {status.value}"
+        status = ExperimentStatus.ERROR
     experiment.status = status
     await registry.update(experiment)
     _write_result(experiment)
@@ -896,6 +940,7 @@ async def add_experiment(data: ExperimentSpecs):
     if registered:
         await _cancel_and_remove(name)
     if exp_out.exists():
+        close_loggers(name)
         # Never destroy a prior run's output on re-submit. Move it aside instead. Abort if the archive fails.
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
         archive = output_root(name, cfg) / "replaced" / f"{name}_{stamp}"

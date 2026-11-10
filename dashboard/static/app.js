@@ -59,9 +59,9 @@ function relAge(raw) {
 
 /* ── Experiments ───────────────────────────────────────────────────────── */
 const STATUS_ORDER = ['Queued', 'Deploying', 'Deployed', 'Configuring', 'Configured',
-  'Running', 'Retrying', 'Finished', 'Error', 'TimedOut', 'Blocked'];
+  'Running', 'Retrying', 'Finished', 'Error', 'TimedOut', 'ExperimentTimedOut', 'Blocked', 'Cancelled'];
 const ACTIVE_STATUSES = new Set(['Deploying', 'Deployed', 'Configuring', 'Configured', 'Running', 'Retrying']);
-const FAILED_STATUSES = new Set(['Error', 'TimedOut', 'Blocked']);
+const FAILED_STATUSES = new Set(['Error', 'TimedOut', 'ExperimentTimedOut', 'Blocked']);
 const LIVE_STATUSES = new Set(['Queued', ...ACTIVE_STATUSES]);  // deletable / re-prioritisable
 
 let allExperiments = [];
@@ -119,7 +119,7 @@ function renderStats() {
           : st === 'Configuring' || st === 'Configured' ? 'config'
           : st === 'Running' ? 'run' : st === 'Retrying' ? 'retry'
           : st === 'Error' ? 'error' : st === 'Finished' ? 'done'
-          : st === 'TimedOut' ? 'timeout' : st === 'Blocked' ? 'blocked' : 'queued'}-fg)">
+          : (st === 'TimedOut' || st === 'ExperimentTimedOut') ? 'timeout' : st === 'Blocked' ? 'blocked' : 'queued'}-fg)">
       <div class="stat-n">${counts[st]}</div><div class="stat-l">${st}</div></div>`);
   }
   strip.innerHTML = cards.join('');
