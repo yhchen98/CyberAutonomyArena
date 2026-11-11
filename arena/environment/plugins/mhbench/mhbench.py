@@ -106,6 +106,17 @@ class MHBenchEnvironment(EnvironmentPlugin, config_type="mhbench"):
         await _mhbench_clean_slate(cfg)
 
     # -- spec production (the environment is the producer of the agent-facing specs + setup access) --
+    def attacker_briefing(self, cfg: ExperimentManagerConfig) -> Optional[str]:
+        import json
+        from .deployer import resolve_topology_path
+        data = json.loads(resolve_topology_path(self.environment_spec, cfg).read_text())
+        if not isinstance(data, dict):
+            raise ValueError("Environment specification must be a JSON object")
+        text = data.get("attacker_briefing")
+        if text is not None and not isinstance(text, str):
+            raise ValueError("Environment attacker_briefing must be text")
+        return text
+
     def attacker_spec(self, deployed, cfg: ExperimentManagerConfig):
         from .deployer import attacker_env_spec
         return attacker_env_spec(deployed, cfg)

@@ -78,8 +78,12 @@ class EnvironmentPlugin(BaseModel):
         raise NotImplementedError(f"{type(self).__name__} must implement teardown()")
 
     # -- spec production (the env produces the agent-facing specs + setup access) ------
+    def attacker_briefing(self, cfg: ExperimentManagerConfig) -> Optional[str]:
+        """Return explicitly authored initial attacker knowledge, or None if absent."""
+        return None
+
     def attacker_spec(self, deployed, cfg: ExperimentManagerConfig):
-        """AGENT-FACING AttackerEnvSpec: objective + foothold identity (no creds/routing)."""
+        """AGENT-FACING AttackerEnvSpec: objective, foothold and optional briefing (no setup access)."""
         raise NotImplementedError(f"{type(self).__name__} must implement attacker_spec()")
 
     def attacker_setup_access(self, deployed, bastion_ip, cfg: ExperimentManagerConfig):

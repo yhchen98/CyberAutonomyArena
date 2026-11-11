@@ -219,8 +219,12 @@ class IncalmoLLMAttacker(AttackerPlugin, config_type="incalmo_llm"):
             ],
         }
 
+    def briefing_context(self) -> str:
+        return ("Your C2 system is execution infrastructure outside the attack scope. "
+                "It carries out actions through your available tools on compromised hosts.")
+
     def build_config(self, experiment_name: str, env_spec: AttackerEnvSpec, prepared: PreparedAttacker) -> dict:
-        return {
+        built = {
             "name": experiment_name,
             "strategy": {
                 "planning_llm": self.planning_llm,
@@ -232,6 +236,9 @@ class IncalmoLLMAttacker(AttackerPlugin, config_type="incalmo_llm"):
             "agent_c2c_server": prepared.remote_url,
             "blacklist_ips": ["172.17.0.0/16"],
         }
+        if env_spec.attacker_briefing is not None:
+            built["attacker_briefing"] = env_spec.attacker_briefing
+        return built
 
     async def run(self, prepared: PreparedAttacker, config_path: Path, experiment_name: str, cfg: ExperimentManagerConfig) -> asyncio.subprocess.Process:
         log_path = output_root(experiment_name, cfg) / experiment_name / "attacker" / "attacker.log"

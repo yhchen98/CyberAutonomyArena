@@ -60,10 +60,7 @@ Shrink the baseline as those land; it must never grow.
 The environment produces **two** things per system, split by **when they're used** — runtime vs setup —
 not by secrecy:
 
-- **Run spec** (`AttackerEnvSpec` / `DefenderEnvSpec`) — the runtime information the agent acts on:
-  objective + identity/knowledge (the attacker's own foothold `{name, host, user}`; the defender's host
-  inventory `{name, ip, role}`). Handed to the agent via `build_config`. **No keys, no bastion, no
-  routing** — the agent doesn't need them at runtime.
+- **Run spec** (`AttackerEnvSpec` / `DefenderEnvSpec`) — the runtime information the agent acts on: objective and identity/knowledge (the attacker’s own foothold and optional authored briefing; the defender’s host inventory). Handed to the agent via `build_config`. The briefing contains only explicitly authored starting knowledge; it does not grant access or automatically expose the topology. Setup credentials and bastion routing remain in `SetupAccess`.
 - **`SetupAccess`** — the setup-time information: a list of `{name, host, user, port, ssh_key,
   ssh_common_args}`, one per reachable host, carrying the scoped key and the bastion ProxyCommand. Used by
   trusted plugin setup code to stand the system up.

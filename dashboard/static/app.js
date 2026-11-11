@@ -641,6 +641,11 @@ $('#env-clear').addEventListener('click', () => {
 function envStem(spec) { return ENV_NICKNAMES[spec] || spec.split('/').pop(); }
 function repeats() { return Math.max(1, parseInt($('#repeats').value, 10) || 1); }
 
+function experimentName(prefix, atk, def, spec, trial, includeBriefing) {
+  return [prefix, atk.slug, def.slug, envStem(spec), includeBriefing ? 'brief' : '', trial]
+    .filter(v => v !== '' && v !== null && v !== undefined).join('_');
+}
+
 function updateComboCount() {
   const n = attackerList.length * defenderList.length * selectedEnvs.size * repeats();
   const el = $('#combo-count');
@@ -659,11 +664,12 @@ $('#submit-form').addEventListener('submit', async (ev) => {
 
   const specs = [...selectedEnvs.keys()];
   const reps = repeats();
+  const includeBriefing = $('#include-attacker-briefing').checked;
 
   // Pre-flight: name-length guard.
   const tooLong = [];
   for (let i = 0; i < reps; i++) for (const atk of attackerList) for (const def of defenderList) for (const spec of specs) {
-    const name = [prefix, atk.slug, def.slug, envStem(spec), i].filter(v => v !== '' && v !== null && v !== undefined).join('_');
+    const name = experimentName(prefix, atk, def, spec, i, includeBriefing);
     if (name.length > MAX_EXP_NAME_LEN) tooLong.push(name);
   }
   if (tooLong.length) {
@@ -674,8 +680,8 @@ $('#submit-form').addEventListener('submit', async (ev) => {
   box.hidden = false; box.innerHTML = 'Submitting…';
   const lines = [];
   for (let i = 0; i < reps; i++) for (const atk of attackerList) for (const def of defenderList) for (const spec of specs) {
-    const name = [prefix, atk.slug, def.slug, envStem(spec), i].filter(v => v !== '' && v !== null && v !== undefined).join('_');
-    const payload = { experiment_name: name, environment: spec, attacker: atk.config, defender: def.config, trial: i };
+    const name = experimentName(prefix, atk, def, spec, i, includeBriefing);
+    const payload = { experiment_name: name, environment: spec, attacker: atk.config, defender: def.config, trial: i, include_attacker_briefing: includeBriefing };
     try {
       const r = await fetch('/api/submit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
       const data = await r.json().catch(() => ({}));

@@ -75,7 +75,10 @@ The body pairs the four pluggable systems (see [`CLAUDE.md`](CLAUDE.md) for the 
 | `attacker_plugin` + `attacker_spec` | yes | The attacker as a `(plugin, spec)` pair. `attacker_spec` is that plugin's fields — an inline object (as here) **or** a path to a JSON/YAML file. |
 | `defender` | no | Embedded `{type, ...}`; `type` names a registered defender (`llm_soc`, `deception`, `prompt_injection`, `velociraptor`, `canary`) and the rest are its fields. Omit for an undefended run. A defender needs an `*_instrumented` topology (it requires a defender box). |
 | `traffic` | no | Embedded `{type, ...}` benign background traffic (`caldera_human`). Omit for none. |
+| `include_attacker_briefing` | no | Include the selected environment’s authored starting knowledge and supported attacker context. Defaults to false. |
 | `trial`, `priority`, `teardown`, `overwrite`, `output_dir` | no | Scheduling / run options (`priority` higher = admitted sooner; `teardown: false` leaves the env standing; `overwrite: true` cancels+replaces a same-named run). |
+
+Attacker briefing is supported by `mhbench` with `incalmo_llm`. When enabled, a missing or blank environment briefing, or an unsupported attacker, returns HTTP 422 before the experiment is queued. The resolved text is snapshotted in `experiment/experiment_config.json` at `attacker.briefing` and passed unchanged in `attacker/attacker_config.json` as `attacker_briefing`. Retries retain the snapshot; the existing attacker objective and access permissions are unchanged.
 
 Each selected plugin must have its code path set in `config.yaml` (see the Config reference below) — e.g.
 the example above needs `incalmo_strategy_dir` (attacker) and `llm_soc_dir` (defender).
@@ -155,6 +158,7 @@ You can mix "real" defenders and "no defender" in the same batch.
 | Field | Effect |
 |---|---|
 | **Repeats** | Run the full attacker × defender × environment matrix this many times |
+| **Include attacker briefing** | Include the selected environment’s authored starting knowledge in each run; unchecked by default. Enabling adds a `brief` component to generated names so briefed and unbriefed runs do not collide. |
 | **Name prefix** | Prepended to every generated experiment name. Leave blank for no prefix. |
 
 The total number of experiments submitted is shown before the submit button fires:

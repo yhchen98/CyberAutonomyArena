@@ -40,8 +40,9 @@ class AttackerBox(BaseModel):
 
 
 class AttackerEnvSpec(BaseModel):
-    """The run spec. The attacker populates only objective and box."""
+    """Attacker-visible objective, foothold identity and optional authored briefing."""
     objective: str = "none"
+    attacker_briefing: Optional[str] = None
     box: Optional[AttackerBox] = None
     hosts: list[AttackerHost] = Field(default_factory=list)
     subnets: list[AttackerSubnet] = Field(default_factory=list)
