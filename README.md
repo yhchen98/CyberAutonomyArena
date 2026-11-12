@@ -113,7 +113,7 @@ field silently backs several.
 | Key | Default | Effect |
 |---|---|---|
 | `max_concurrent_experiments` | `1` | How many experiments may deploy or run at the same time. Teardowns are always prioritized over new deployments when the limit is reached. |
-| `max_retries` | `3` | How many times a failed experiment is automatically retried. Set to `0` to disable retries. |
+| `max_retries` | `3` | Maximum automatic retries for failed attempts across deployment, configuration, setup, and execution. Set to `0` to disable retries. |
 
 ---
 
@@ -348,8 +348,8 @@ Each experiment writes to `output/<experiment_name>/`:
 ```
 output/<experiment_name>/
   experiment/
-    experiment_config.json   ← full Pydantic dump of the Experiment model
-    result.json              ← {"status": "Finished"} or {"status": "Error"}
+    experiment_config.json   ← submitted configuration, grouped by component
+    experiment_result.json   ← runtime status and timestamps, grouped by component
   attacker/
     attacker_config.json     ← config dict from build_config()
     attacker.log             ← stdout+stderr of the attacker process
@@ -359,7 +359,7 @@ output/<experiment_name>/
     defender.log             ← stdout+stderr of the defender process
 ```
 
-Every failed experiment's output folder is moved to `output/failed/<experiment_name>/`. If the retry budget is not exhausted, the next attempt then runs fresh under `output/`.
+Failed-attempt archives use `output/failed/<experiment_name>_<retry_count>/`, with a timestamp suffix when that path already exists. Automatic retries require remaining budget, successful teardown, and successful archiving. Each retry starts fresh under `output/<experiment_name>/`.
 
 After collection, the harness also fetches each host's ground-truth logs into
 `output/<experiment_name>/environment/<host>/` (auth.log, syslog, `audit.log`, cmdlog,

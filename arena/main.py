@@ -429,7 +429,7 @@ def _write_result(experiment: Experiment) -> None:
 
 
 async def _handle_failure(experiment: Experiment, reason: Optional[str] = None) -> None:
-    """Record and archive the failed attempt before starting a clean retry."""
+    """Archive the failed attempt and retry after teardown within the configured limit."""
     name = experiment.experiment_name
     if reason:
         experiment.error = reason

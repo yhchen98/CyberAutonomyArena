@@ -17,6 +17,7 @@ from ....experiment_log import output_root
 from ...env_spec import AttackerEnvSpec
 from ....ui_schema import PluginUISchema
 from ..base import AttackerPlugin, PreparedAttacker
+from ..incalmo_strategy.foothold import install_metasploit
 
 # Incalmo C2 attacker driven by a free-form LLM planning loop.
 
@@ -157,9 +158,11 @@ class IncalmoLLMAttacker(AttackerPlugin, config_type="incalmo_llm"):
         return IncalmoPreparedC2(remote_url=remote_url, local_url=local_url)
 
     async def prepare_foothold(self, experiment, cfg: ExperimentManagerConfig, bastion_ip, remote_url, access=None):
-        """Land the sandcat agent and install Metasploit on the attacker's foothold(s)."""
-        await foothold.land_sandcat(_require_access(access), remote_url, cfg, experiment.experiment_name)
-        await foothold.install_metasploit(_require_access(access), cfg, experiment.experiment_name)
+        """Prepare Sandcat and the selected abstraction's dependencies."""
+        access = _require_access(access)
+        await foothold.land_sandcat(access, remote_url, cfg, experiment.experiment_name)
+        if self.abstraction == "low_level_actions":
+            await install_metasploit(access, cfg, experiment.experiment_name)
 
     async def launch_c2c(
         self, experiment_name: str, cfg: ExperimentManagerConfig, bastion_ip: Optional[str] = None,

@@ -106,8 +106,3 @@ async def land_sandcat(access: list[AttackerSetupAccess], remote_url: Optional[s
         raise RuntimeError(f"cannot derive caldera_ip/port from C2 URL {remote_url!r} for sandcat landing")
     await run_play("start_incalmo.yml", access,
                    {"caldera_ip": caldera_ip, "caldera_port": caldera_port}, cfg, experiment_name)
-
-
-async def install_metasploit(access: list[AttackerSetupAccess], cfg: ExperimentManagerConfig, experiment_name: str) -> None:
-    """Install msfrpcd + pymetasploit3 on the attacker's foothold(s) (MHBench's install_metasploit)."""
-    await run_play("install_metasploit.yml", access, {}, cfg, experiment_name)
