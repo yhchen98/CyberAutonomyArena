@@ -65,6 +65,7 @@ class ExperimentSpecs(BaseModel):
     output_dir: Optional[str] = None
     teardown: bool = True
     overwrite: bool = False
+    include_attacker_briefing: bool = False
     priority: int = 0
 
     @field_validator("environment", mode="before")
@@ -101,9 +102,9 @@ def _json_default(o):
 
 
 _CONFIG_KEYS = {
-    "experiment": ("name", "trial", "teardown", "priority"),
+    "experiment": ("name", "trial", "teardown", "priority", "include_attacker_briefing"),
     "environment": ("config", "spec"),
-    "attacker": ("config", "plugin", "spec_path"),
+    "attacker": ("config", "plugin", "spec_path", "briefing"),
     "defender": ("config",),
 }
 
@@ -134,6 +135,7 @@ class Experiment:
     base_name = _Field("experiment", "base_name")
     teardown = _Field("experiment", "teardown")
     priority = _Field("experiment", "priority")
+    include_attacker_briefing = _Field("experiment", "include_attacker_briefing")
     created_at = _Field("experiment", "created_at")
     updated_at = _Field("experiment", "updated_at")
     environment_config = _Field("environment", "config")
@@ -152,6 +154,7 @@ class Experiment:
     attacker = _Field("attacker", "config")
     attacker_plugin = _Field("attacker", "plugin")
     attacker_spec = _Field("attacker", "spec_path")
+    attacker_briefing = _Field("attacker", "briefing")
     pid = _Field("attacker", "pid")
     attacker_started_at = _Field("attacker", "started_at")
     attacker_finished_at = _Field("attacker", "finished_at")
@@ -172,13 +175,15 @@ class Experiment:
     defender_stopped_at = _Field("defender", "stopped_at")
 
     def __init__(self, experiment_name, status, environment, attacker=None, defender=None,
-                 trial=0, teardown=True, created_at=None, updated_at=None, priority=0):
+                 trial=0, teardown=True, created_at=None, updated_at=None, priority=0,
+                 include_attacker_briefing=False, attacker_briefing=None):
         created_at = created_at or datetime.now(timezone.utc)
         env_config = environment if isinstance(environment, EnvironmentConfig) else EnvironmentConfig.model_validate(environment)
         self.metadata = {
             "experiment": {
                 "name": experiment_name, "trial": trial, "status": status, "error": None,
                 "retry_count": 0, "base_name": "", "teardown": teardown, "priority": priority,
+                "include_attacker_briefing": include_attacker_briefing,
                 "created_at": created_at, "updated_at": updated_at or created_at,
             },
             "environment": {
@@ -191,6 +196,7 @@ class Experiment:
             },
             "attacker": {
                 "config": attacker, "plugin": None, "spec_path": None, "pid": None,
+                "briefing": attacker_briefing,
                 "started_at": None, "finished_at": None,
                 "lifecycle_status": None, "last_command": None, "setup_started_at": None,
                 "ready_at": None, "stopping_at": None, "stopped_at": None,

@@ -31,7 +31,7 @@ async def _stop_defender_process(experiment, process, cfg) -> None:
     except Exception:
         pass
 from .defender import run_defender
-from .environment import DeployedEnvironment, EnvironmentLifecycle, EnvironmentSignal, EnvironmentCommand
+from .environment import DeployedEnvironment, EnvironmentLifecycle, EnvironmentSignal, EnvironmentCommand, build_environment
 from .environment.lifecycle import signal_recorder as _env_signal_recorder
 from .environment.capacity import CapacityTracker
 from .config import ExperimentManagerConfig
@@ -429,7 +429,7 @@ def _write_result(experiment: Experiment) -> None:
 
 
 async def _handle_failure(experiment: Experiment, reason: Optional[str] = None) -> None:
-    """Record and archive the failed attempt before starting a clean retry."""
+    """Archive the failed attempt and retry after teardown within the configured limit."""
     name = experiment.experiment_name
     if reason:
         experiment.error = reason
@@ -727,6 +727,7 @@ async def _run_experiment(experiment: Experiment) -> None:
     experiment._attacker_lifecycle = attacker_lc
     # The environment produces the agent-facing AttackerEnvSpec and the harness-only scoped SetupAccess.
     experiment._attacker_env_spec = experiment.environment.attacker_spec(experiment.deployed_environment, cfg)
+    experiment._attacker_env_spec.attacker_briefing = experiment.attacker_briefing
     attacker_access = experiment.environment.attacker_setup_access(experiment.deployed_environment, bastion_ip, cfg)
     try:
         # Gate C2 bring-up (requires_docker) under _attacker_setup_lock. Shell agents run ungated.
@@ -929,6 +930,19 @@ app = FastAPI(title="Experiment Manager", lifespan=lifespan)
 
 @app.post("/experiments", status_code=201)
 async def add_experiment(data: ExperimentSpecs):
+    briefing = None
+    if data.include_attacker_briefing:
+        context = data.attacker.briefing_context()
+        if context is None:
+            raise HTTPException(status_code=422, detail=f"Attacker plugin {data.attacker_plugin!r} does not support attacker briefings")
+        try:
+            authored = build_environment(data.environment).attacker_briefing(cfg)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=f"Cannot read attacker briefing: {exc}") from exc
+        if not authored or not authored.strip():
+            raise HTTPException(status_code=422, detail="Selected environment has no attacker briefing")
+        briefing = "\n\n".join(part for part in (authored, context) if part)
+
     now = datetime.now(timezone.utc)
     name = data.experiment_name
     register_output_root(name, data.output_dir)
@@ -962,6 +976,8 @@ async def add_experiment(data: ExperimentSpecs):
         created_at=now,
         updated_at=now,
         priority=max(0, min(1000, int(data.priority))),  # clamp to a sane band
+        include_attacker_briefing=data.include_attacker_briefing,
+        attacker_briefing=briefing,
     )
     # Record the (plugin, spec-file) provenance.
     experiment.attacker_plugin = data.attacker_plugin

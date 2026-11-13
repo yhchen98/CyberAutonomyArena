@@ -77,7 +77,7 @@ max_concurrent_collects: 2         # concurrent post-run host-log collect
 max_concurrent_attacker_setups: 2  # concurrent C2-attacker bring-up
 max_active_experiments: 25         # hard cap on concurrently active experiments
 max_deployed: 10                   # cap experiments in the deploy stage (back-pressure)
-max_retries: 3
+max_retries: 3                    # automatic retries of failed attempts; 0 disables retries
 # max_active_vms: 100              # optional cap on total VMs across active experiments
 
 # ---- GCP-only capacity (leave unset for OpenStack) ---------------------------

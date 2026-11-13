@@ -59,6 +59,10 @@ class AttackerPlugin(BaseModel):
         """REQUIRED. The run config the agent reads. Ignore prepared unless setup() produced state the config needs."""
         ...
 
+    def briefing_context(self) -> Optional[str]:
+        """Return generic execution context; None means briefings are unsupported."""
+        return None
+
     @classmethod
     def ui_schema(cls) -> PluginUISchema:
         """REQUIRED. The dashboard form for this plugin."""

@@ -17,6 +17,7 @@ from ....experiment_log import output_root
 from ...env_spec import AttackerEnvSpec
 from ....ui_schema import PluginUISchema
 from ..base import AttackerPlugin, PreparedAttacker
+from ..incalmo_strategy.foothold import install_metasploit
 
 # Incalmo C2 attacker driven by a free-form LLM planning loop.
 
@@ -157,9 +158,11 @@ class IncalmoLLMAttacker(AttackerPlugin, config_type="incalmo_llm"):
         return IncalmoPreparedC2(remote_url=remote_url, local_url=local_url)
 
     async def prepare_foothold(self, experiment, cfg: ExperimentManagerConfig, bastion_ip, remote_url, access=None):
-        """Land the sandcat agent and install Metasploit on the attacker's foothold(s)."""
-        await foothold.land_sandcat(_require_access(access), remote_url, cfg, experiment.experiment_name)
-        await foothold.install_metasploit(_require_access(access), cfg, experiment.experiment_name)
+        """Prepare Sandcat and the selected abstraction's dependencies."""
+        access = _require_access(access)
+        await foothold.land_sandcat(access, remote_url, cfg, experiment.experiment_name)
+        if self.abstraction == "low_level_actions":
+            await install_metasploit(access, cfg, experiment.experiment_name)
 
     async def launch_c2c(
         self, experiment_name: str, cfg: ExperimentManagerConfig, bastion_ip: Optional[str] = None,
@@ -219,8 +222,12 @@ class IncalmoLLMAttacker(AttackerPlugin, config_type="incalmo_llm"):
             ],
         }
 
+    def briefing_context(self) -> str:
+        return ("Your C2 system is execution infrastructure outside the attack scope. "
+                "It carries out actions through your available tools on compromised hosts.")
+
     def build_config(self, experiment_name: str, env_spec: AttackerEnvSpec, prepared: PreparedAttacker) -> dict:
-        return {
+        built = {
             "name": experiment_name,
             "strategy": {
                 "planning_llm": self.planning_llm,
@@ -232,6 +239,9 @@ class IncalmoLLMAttacker(AttackerPlugin, config_type="incalmo_llm"):
             "agent_c2c_server": prepared.remote_url,
             "blacklist_ips": ["172.17.0.0/16"],
         }
+        if env_spec.attacker_briefing is not None:
+            built["attacker_briefing"] = env_spec.attacker_briefing
+        return built
 
     async def run(self, prepared: PreparedAttacker, config_path: Path, experiment_name: str, cfg: ExperimentManagerConfig) -> asyncio.subprocess.Process:
         log_path = output_root(experiment_name, cfg) / experiment_name / "attacker" / "attacker.log"
