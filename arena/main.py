@@ -367,12 +367,24 @@ async def _teardown(experiment: Experiment, delete_c2: bool = True) -> bool:  # 
     experiment.teardown_started_at = datetime.now(timezone.utc)
     await registry.update(experiment)
 
-    # Tear down the C2 (a no-op for an attacker that has none), unless delete_c2 preserves it.
-    if experiment.attacker and delete_c2:
+    # Restore the experimental control plane before management-dependent collection. The C2
+    # relay's control path is retained throughout sealing; all other control ports are reattached.
+    # Read-only final attack-state evidence must precede restoration. Provider state and a
+    # bounded console tail are independent of the guest-controlled console reporter.
+    try:
+        await experiment.environment.capture_attack_state(experiment, cfg)
+    except Exception:
+        get_logger(experiment.experiment_name).exception(
+            "Attack-state capture failed for '%s'", experiment.experiment_name)
+
+    if getattr(experiment, "_seal_attempted", False):
         try:
-            await experiment.attacker.teardown(experiment.experiment_name, cfg)
+            await experiment.environment.restore(experiment, cfg)
+            experiment._sealed = False
+            await experiment.environment.verify_restoration(experiment, cfg)
         except Exception:
-            get_logger(experiment.experiment_name).exception("Failed to stop C2 for '%s'", experiment.experiment_name)
+            get_logger(experiment.experiment_name).exception(
+                "Failed to restore control plane for '%s'", experiment.experiment_name)
 
     # Pull host logs while the range is still up, under _collect_lock. Best-effort: never block teardown.
     try:
@@ -399,6 +411,14 @@ async def _teardown(experiment: Experiment, delete_c2: bool = True) -> bool:  # 
             )
         except Exception:
             get_logger(experiment.experiment_name).exception("Defender-log collection failed for '%s'", experiment.experiment_name)
+
+    # Stop the C2 only after all host/attacker/defender evidence has been collected. The C2
+    # container and its tunnel are infrastructure, not attack-effect cleanup.
+    if experiment.attacker and delete_c2:
+        try:
+            await experiment.attacker.teardown(experiment.experiment_name, cfg)
+        except Exception:
+            get_logger(experiment.experiment_name).exception("Failed to stop C2 for '%s'", experiment.experiment_name)
 
     # Defender teardown (harness-side cleanup) runs before the environment teardown. Best-effort.
     if experiment.defender:
@@ -737,6 +757,7 @@ async def _run_experiment(experiment: Experiment) -> None:
                 prepared = await _drive_attacker_setup(experiment, cfg, bastion_ip, attacker_lc, attacker_access)
         else:
             prepared = await _drive_attacker_setup(experiment, cfg, bastion_ip, attacker_lc, attacker_access)
+        experiment._attacker_prepared = prepared
         await registry.update(experiment)
     except Exception as e:
         exp_log.exception("Attacker setup failed for '%s'", experiment.experiment_name)
@@ -796,6 +817,21 @@ async def _run_experiment(experiment: Experiment) -> None:
                     await _lc.emit(DefenderSignal.FAILED, str(e))
                 await _handle_failure(experiment, f"Failed to start defender — {e}")
                 return
+
+    # Seal the experimental control plane after all setup and before any attack action. The
+    # C2 relay's control interface (when present) remains the only infrastructure path.
+    experiment._bastion_ip = bastion_ip
+    experiment._seal_attempted = True
+    try:
+        await experiment.environment.seal(experiment, cfg)
+        experiment._sealed = True
+        await experiment.environment.verify_ready(experiment, cfg)
+    except Exception as e:
+        exp_log.exception("Seal/readiness failed for '%s'", experiment.experiment_name)
+        if defender_process:
+            await _stop_defender_process(experiment, defender_process, cfg)
+        await _handle_failure(experiment, f"Seal/readiness failed — {e}")
+        return
 
     try:
         await attacker_lc.send(AttackerCommand.START_RUN)

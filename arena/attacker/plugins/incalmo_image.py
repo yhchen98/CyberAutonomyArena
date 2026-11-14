@@ -10,7 +10,7 @@ import uuid
 from ...experiment_log import attacker_log as log
 
 
-def start_c2_image(experiment_name: str, image_id: str, ssh: list[str]) -> None:
+def start_c2_image(experiment_name: str, image_id: str, ssh: list[str], c2_urls: str | None = None) -> None:
     # Containerd and classic stores can assign different IDs to the same image.
     # A private shipment tag preserves the selection without racing the build tag.
     tag = f"incalmo/c2c:arena-{uuid.uuid4().hex}"
@@ -50,8 +50,12 @@ def start_c2_image(experiment_name: str, image_id: str, ssh: list[str]) -> None:
         ).stdout.strip()
         log(experiment_name, f"C2 image loaded on foothold: {loaded} (source: {image_id})")
         stage = "start container"
+        env_args = ""
+        if c2_urls:
+            env_args = f"-e C2C_SERVER={shlex.quote(c2_urls)} -e C2C_SERVER_AGENTS={shlex.quote(c2_urls)} "
         subprocess.run(
-            ssh + [f"docker run --pull=never -d --name c2 --network host {shlex.quote(loaded)}"],
+            ssh + [f"docker run --pull=never -d --name c2 --network host "
+                   f"--cap-drop ALL --security-opt no-new-privileges {env_args}{shlex.quote(loaded)}"],
             check=True, capture_output=True, text=True, timeout=180,
         )
         log(experiment_name, f"C2 container started from image: {loaded}")

@@ -1,5 +1,7 @@
 """MHBench environment plugin: deploys an MHBench topology (named by ``environment_spec``) as the experiment's network."""
 from __future__ import annotations
+
+import asyncio
 from ...config import env_backend  # env-layer backend settings
 
 from pathlib import Path
@@ -95,6 +97,30 @@ class MHBenchEnvironment(EnvironmentPlugin, config_type="mhbench"):
         if lc:
             lc.emit(EnvironmentSignal.CONFIGURED)
 
+    async def seal(self, experiment: "Experiment", cfg: ExperimentManagerConfig) -> dict:
+        from .deployer import run_control_plane_lifecycle
+        return await asyncio.to_thread(
+            run_control_plane_lifecycle, experiment.experiment_name,
+            self.environment_spec, cfg, "seal", getattr(experiment, "_bastion_ip", None))
+
+    async def restore(self, experiment: "Experiment", cfg: ExperimentManagerConfig) -> dict:
+        from .deployer import run_control_plane_lifecycle
+        return await asyncio.to_thread(
+            run_control_plane_lifecycle, experiment.experiment_name,
+            self.environment_spec, cfg, "restore")
+
+    async def verify_ready(self, experiment: "Experiment", cfg: ExperimentManagerConfig) -> None:
+        from .deployer import verify_ready as _verify_ready
+        await asyncio.to_thread(_verify_ready, experiment, cfg)
+
+    async def verify_restoration(self, experiment: "Experiment", cfg: ExperimentManagerConfig) -> None:
+        from .deployer import verify_restoration as _verify_restoration
+        await asyncio.to_thread(_verify_restoration, experiment, cfg)
+
+    async def capture_attack_state(self, experiment: "Experiment", cfg: ExperimentManagerConfig) -> None:
+        from .deployer import capture_attack_state as _capture
+        await asyncio.to_thread(_capture, experiment, cfg)
+
     async def collect(self, experiment: "Experiment", cfg: ExperimentManagerConfig) -> None:
         from .collect import collect_environment
         await collect_environment(experiment, cfg)
@@ -125,9 +151,15 @@ class MHBenchEnvironment(EnvironmentPlugin, config_type="mhbench"):
         from .deployer import attacker_setup_access, _bastion_proxy_args
         # Both hops in SetupAccess use the scoped foothold-only credential. The management key never enters it.
         cred = self.attacker_credential(deployed, cfg)
-        proxy = _bastion_proxy_args(bastion_ip, cred)
-        return [a.model_copy(update={"ssh_key": cred, "ssh_common_args": proxy})
-                for a in attacker_setup_access(deployed, bastion_ip, cfg)]
+        out = []
+        for a in attacker_setup_access(deployed, bastion_ip, cfg):
+            if a.name == "c2" and a.ssh_key:
+                # Preserve the relay's admin/tunnel keys and mh-hop forced-proxy arguments.
+                out.append(a)
+            else:
+                common = a.ssh_common_args if "relay-guest-proxy" in a.ssh_common_args else _bastion_proxy_args(bastion_ip, cred)
+                out.append(a.model_copy(update={"ssh_key": cred, "ssh_common_args": common}))
+        return out
 
     def defender_spec(self, deployed, cfg: ExperimentManagerConfig):
         from .deployer import defender_env_spec

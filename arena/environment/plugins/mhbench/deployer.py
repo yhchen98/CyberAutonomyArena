@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -92,13 +93,56 @@ def attacker_setup_access(deployed: Optional[DeployedEnvironment], bastion_ip: O
     if not kali_ip:
         return []
     key = _mhbench_ssh_key(cfg)
-    proxy = ""
-    if bastion_ip:
-        proxy = (
+    def proxy_for(host: str) -> str:
+        if not bastion_ip:
+            return ""
+        return (
             f'-o ProxyCommand="ssh -W %h:%p -i {key} -o BatchMode=yes -o PasswordAuthentication=no '
             f'-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@{bastion_ip}"'
         )
-    return [AttackerSetupAccess(name=_KALI_FOOTHOLD, host=kali_ip, user="root", ssh_key=key, ssh_common_args=proxy)]
+    topo = Path(deployed.topology_spec) if deployed and deployed.topology_spec else None
+    relay = None
+    if topo and topo.exists():
+        data = json.loads(topo.read_text())
+        for network in data.get("networks", []):
+            for subnet in network.get("subnets", []):
+                for host in subnet.get("hosts", []):
+                    if host.get("infrastructure"):
+                        relay = host
+                        break
+                if relay:
+                    break
+            if relay:
+                break
+    keydir = Path(cfg.mhbench_dir) / "keys"
+    admin_key = keydir / "relay_admin"
+    mh_hop_key = keydir / "mh_hop"
+    c2_proxy_key = keydir / "c2_proxy"
+    guest_proxy_key = keydir / "guest_proxy"
+    relay_ip = str(relay.get("ip_address")) if relay else None
+    if relay_ip and mh_hop_key.exists() and guest_proxy_key.exists():
+        kali_proxy = _forced_guest_proxy_args(bastion_ip, relay_ip, guest_proxy_key, mh_hop_key)
+    else:
+        kali_proxy = proxy_for(kali_ip)
+    access = [AttackerSetupAccess(name=_KALI_FOOTHOLD, host=kali_ip, user="root",
+                                  ssh_key=key, ssh_common_args=kali_proxy)]
+    if relay and relay_ip:
+        data_ip = next((i.get("ip_address") for i in relay.get("extra_interfaces", [])
+                        if i.get("subnet") in {"relay_lan"}), None)
+        if admin_key.exists() and mh_hop_key.exists() and c2_proxy_key.exists():
+            mh_proxy = _mh_hop_proxy_args(bastion_ip, mh_hop_key)
+            access.append(AttackerSetupAccess(
+                name="c2", host=relay_ip, user="root",
+                ssh_key=str(admin_key), ssh_common_args=mh_proxy,
+                service_host=str(data_ip) if data_ip else None,
+                tunnel_user="relay-c2-proxy", tunnel_key=str(c2_proxy_key),
+                tunnel_ssh_common_args=mh_proxy))
+        else:
+            access.append(AttackerSetupAccess(
+                name="c2", host=relay_ip, user="root",
+                ssh_key=key, ssh_common_args=proxy_for(relay_ip),
+                service_host=str(data_ip) if data_ip else None))
+    return access
 
 
 _ATTACKER_SUBNET = "attacker_subnet"
@@ -204,6 +248,34 @@ def _bastion_proxy_args(bastion_ip: Optional[str], key: str) -> str:
         f'-o ProxyCommand="ssh -W %h:%p -i {key} -o IdentitiesOnly=yes -o BatchMode=yes '
         f'-o PasswordAuthentication=no -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null '
         f'root@{bastion_ip}"'
+    )
+
+
+def _forced_guest_proxy_args(bastion_ip: Optional[str], relay_ip: str,
+                              guest_proxy_key: Path, mh_hop_key: Path) -> str:
+    """ProxyCommand for an experimental guest: mh-hop -> relay guest-proxy -> guest:22."""
+    if not bastion_ip:
+        return ""
+    inner = (
+        f"ssh -i {mh_hop_key} -o BatchMode=yes -o StrictHostKeyChecking=no "
+        f"-o UserKnownHostsFile=/dev/null mh-hop@{bastion_ip} {relay_ip} 22"
+    )
+    return (
+        f'-o ProxyCommand="ssh -i {guest_proxy_key} -o BatchMode=yes '
+        f'-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null '
+        f'-o ProxyCommand=\'{inner}\' relay-guest-proxy@{relay_ip} %h %p"'
+    )
+
+
+def _mh_hop_proxy_args(bastion_ip: Optional[str], mh_hop_key: Path) -> str:
+    """Proxy to a relay through the management host's forced mh-hop account, not root -W."""
+    if not bastion_ip:
+        return ""
+    return (
+        f'-o IdentitiesOnly=yes '
+        f'-o ProxyCommand="ssh -i {mh_hop_key} -o IdentitiesOnly=yes -o BatchMode=yes '
+        f'-o PasswordAuthentication=no -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null '
+        f'mh-hop@{bastion_ip} %h %p"'
     )
 
 
@@ -389,6 +461,39 @@ def _provision_sync(
     ), bastion_ip
 
 
+def run_control_plane_lifecycle(
+    experiment_name: str,
+    environment_spec: str,
+    cfg: ExperimentManagerConfig,
+    command: str,
+    mgmt_ip: Optional[str] = None,
+) -> dict:
+    """Run MHBench's seal/restore control-plane command for a deployed isolated topology."""
+    mhbench_dir = cfg.mhbench_dir
+    topology_path = resolve_topology_path(environment_spec, cfg)
+    python = mhbench_dir / ".venv" / "bin" / "python"
+    cli = mhbench_dir / "cli.py"
+    mhbench_log = output_root(experiment_name, cfg) / experiment_name / "experiment" / "mhbench.log"
+    mhbench_log.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [str(python), str(cli), *_mhb_config_args(cfg), command, str(topology_path),
+           "--project-name", experiment_name]
+    if mgmt_ip:
+        cmd += ["--mgmt-ip", str(mgmt_ip)]
+    with open(mhbench_log, "a") as lf:
+        result = subprocess.run(cmd, cwd=str(mhbench_dir), stdout=lf, stderr=subprocess.STDOUT)
+    if result.returncode != 0:
+        raise _mhbench_error(command, result.returncode, mhbench_log)
+    # The CLI prints one JSON report line; re-read the log tail for the most recent report.
+    for line in reversed(mhbench_log.read_text(errors="replace").splitlines()):
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                return json.loads(line)
+            except ValueError:
+                continue
+    return {}
+
+
 def _configure_sync(
     experiment_name: str,
     environment_spec: str,
@@ -435,6 +540,113 @@ async def provision_environment(
     return await loop.run_in_executor(
         None, _provision_sync, experiment.experiment_name, experiment.environment_spec, c2c_url, cfg
     )
+
+
+def _openstack_json(args: list[str]) -> object | None:
+    try:
+        r = subprocess.run(["openstack", *args, "-f", "json"], capture_output=True, text=True, timeout=90)
+        return json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else None
+    except Exception:
+        return None
+
+
+def _topology_hosts(experiment: Experiment) -> list[dict]:
+    deployed = experiment.deployed_environment
+    topo = deployed.topology_spec if deployed else None
+    if not topo or not Path(topo).exists():
+        return []
+    data = json.loads(Path(topo).read_text())
+    hosts = []
+    for network in data.get("networks", []):
+        for subnet in network.get("subnets", []):
+            for host in subnet.get("hosts", []):
+                hosts.append(host)
+    return hosts
+
+
+def verify_ready(experiment: Experiment, cfg: ExperimentManagerConfig) -> None:
+    deployed = experiment.deployed_environment
+    if not deployed or not deployed.project_name:
+        return
+    project = deployed.project_name
+    ports = _openstack_json(["port", "list"]) or []
+    by_name = {p.get("Name"): p for p in ports if isinstance(p, dict)}
+    for host in _topology_hosts(experiment):
+        if host.get("infrastructure") or not host.get("name"):
+            continue
+        port = by_name.get(f"{project}-{host['name']}-nic-0")
+        if port is None:
+            raise RuntimeError(f"readiness: control port for {host['name']} is missing")
+        if port.get("Status") == "ACTIVE" or port.get("device_id"):
+            raise RuntimeError(f"readiness: control port for {host['name']} is still attached")
+    relay = next((h for h in _topology_hosts(experiment) if h.get("infrastructure")), None)
+    if relay:
+        port = by_name.get(f"{project}-{relay['name']}-nic-0")
+        if port is None or port.get("Status") != "ACTIVE":
+            raise RuntimeError("readiness: relay control port is not active")
+    # The console audit is supporting evidence; its absence is recorded, not treated as independent proof.
+    names = [h["name"] for h in _topology_hosts(experiment) if not h.get("infrastructure") and h.get("name")]
+    if names:
+        try:
+            r = subprocess.run(["openstack", "console", "log", "show", "--lines", "80",
+                                f"{project}-{names[0]}"], capture_output=True, text=True, timeout=60)
+            if "mhbench-console-audit" not in r.stdout:
+                log(experiment.experiment_name, "readiness: console audit marker not visible yet")
+        except Exception:
+            pass
+
+
+def verify_restoration(experiment: Experiment, cfg: ExperimentManagerConfig) -> None:
+    deployed = experiment.deployed_environment
+    if not deployed or not deployed.project_name:
+        return
+    project = deployed.project_name
+    ports = _openstack_json(["port", "list"]) or []
+    by_name = {p.get("Name"): p for p in ports if isinstance(p, dict)}
+    for host in _topology_hosts(experiment):
+        if host.get("infrastructure") or not host.get("name"):
+            continue
+        port = by_name.get(f"{project}-{host['name']}-nic-0")
+        if port is None or port.get("Status") != "ACTIVE":
+            raise RuntimeError(f"restoration: control port for {host['name']} is not active")
+
+
+def capture_attack_state(experiment: Experiment, cfg: ExperimentManagerConfig) -> None:
+    deployed = experiment.deployed_environment
+    out = output_root(experiment.experiment_name, cfg) / experiment.experiment_name / "attack_state"
+    out.mkdir(parents=True, exist_ok=True)
+    for name, args in (
+        ("servers", ["server", "list"]),
+        ("ports", ["port", "list"]),
+        ("routers", ["router", "list"]),
+        ("subnets", ["subnet", "list"]),
+        ("security_groups", ["security", "group", "list"]),
+    ):
+        data = _openstack_json(args)
+        if data is not None:
+            (out / f"{name}.json").write_text(json.dumps(data, indent=2) + "\n")
+    if deployed and deployed.project_name:
+        for host in _topology_hosts(experiment):
+            name = host.get("name")
+            if not name:
+                continue
+            try:
+                r = subprocess.run(["openstack", "console", "log", "show", "--lines", "200",
+                                    f"{deployed.project_name}-{name}"],
+                                   capture_output=True, text=True, timeout=60)
+                if r.returncode == 0:
+                    (out / f"console-{name}.log").write_text(r.stdout)
+            except Exception:
+                continue
+    prepared = getattr(experiment, "_attacker_prepared", None)
+    local_url = getattr(prepared, "local_url", None) if prepared else None
+    if local_url:
+        for name, path in (("c2_agents", "/agents"), ("c2_logs", "/get_latest_logs")):
+            try:
+                with urllib.request.urlopen(local_url.rstrip("/") + path, timeout=10) as r:
+                    (out / f"{name}.json").write_bytes(r.read())
+            except Exception:
+                continue
 
 
 async def configure_environment(
