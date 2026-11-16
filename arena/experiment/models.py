@@ -215,6 +215,10 @@ class Experiment:
                 if key not in _CONFIG_KEYS[group]:
                     self.metadata[group][key] = None
         self.metadata.pop("runtime", None)
+        # Lifecycle objects and setup/seal state belong to the archived attempt.
+        for name in list(vars(self)):
+            if name.startswith("_"):
+                delattr(self, name)
 
     @property
     def environment(self):

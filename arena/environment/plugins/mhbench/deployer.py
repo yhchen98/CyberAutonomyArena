@@ -2,10 +2,12 @@ from __future__ import annotations
 from ...config import env_backend
 
 import asyncio
+import ipaddress
 import json
 import os
 import re
 import subprocess
+import time
 import urllib.request
 from pathlib import Path
 from typing import Optional
@@ -51,6 +53,12 @@ def resolve_topology_path(environment_spec: str, cfg) -> Path:
     """Resolve environment_spec (absolute, or relative to mhbench_dir) to the topology JSON path."""
     p = Path(environment_spec)
     return p if p.is_absolute() else cfg.mhbench_dir / p
+
+
+def topology_isolation(environment_spec: str, cfg) -> bool:
+    """True when the topology explicitly opts into management isolation."""
+    data = json.loads(resolve_topology_path(environment_spec, cfg).read_text())
+    return bool((data.get("routing") or {}).get("isolate_management"))
 
 
 def _mhb_config_args(cfg) -> list:
@@ -542,12 +550,16 @@ async def provision_environment(
     )
 
 
-def _openstack_json(args: list[str]) -> object | None:
-    try:
-        r = subprocess.run(["openstack", *args, "-f", "json"], capture_output=True, text=True, timeout=90)
-        return json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else None
-    except Exception:
-        return None
+def _openstack_json(args: list[str], *, rows: bool = False) -> dict | list[dict]:
+    result = subprocess.run(["openstack", *args, "-f", "json"],
+                            capture_output=True, text=True, timeout=90)
+    if result.returncode:
+        raise RuntimeError(f"OpenStack {' '.join(args)} failed: {result.stderr.strip()}")
+    data = json.loads(result.stdout)
+    expected = list if rows else dict
+    if not isinstance(data, expected) or (rows and any(not isinstance(row, dict) for row in data)):
+        raise RuntimeError(f"OpenStack {' '.join(args)} returned an unexpected JSON shape")
+    return data
 
 
 def _topology_hosts(experiment: Experiment) -> list[dict]:
@@ -564,89 +576,217 @@ def _topology_hosts(experiment: Experiment) -> list[dict]:
     return hosts
 
 
+def _project_networks(experiment: Experiment) -> list[dict]:
+    deployed = experiment.deployed_environment
+    if not deployed or not deployed.project_name or not deployed.topology_spec:
+        raise RuntimeError("Missing deployed topology or project name")
+    topology = json.loads(Path(deployed.topology_spec).read_text())
+    names = {subnet["name"] for network in topology["networks"]
+             for subnet in network.get("subnets", [])} | {"management_network"}
+    return [_openstack_json(["network", "show", f"{deployed.project_name}-{name}"])
+            for name in sorted(names)]
+
+
+def _project_ports(networks: list[dict]) -> list[dict]:
+    """Read ports by owned network IDs, including unnamed provider attachments."""
+    if not isinstance(networks, list):
+        raise RuntimeError("Owned-network observation is unavailable")
+    return [_openstack_json(["port", "show", port["ID"]])
+            for network in networks
+            for port in _openstack_json(["port", "list", "--network", network["id"]], rows=True)]
+
+
+def _data_cidrs(experiment: Experiment) -> set:
+    deployed = experiment.deployed_environment
+    topo = deployed.topology_spec if deployed else None
+    if not topo or not Path(topo).exists():
+        return set()
+    data = json.loads(Path(topo).read_text())
+    return {
+        ipaddress.ip_network(subnet["cidr"])
+        for network in data.get("networks", [])
+        for subnet in network.get("subnets", [])
+        if not subnet.get("hosts")
+    }
+
+
+def _c2_local_url(experiment: Experiment) -> str | None:
+    prepared = getattr(experiment, "_attacker_prepared", None)
+    return getattr(prepared, "local_url", None) if prepared else None
+
+
+def _c2_agents(local_url: str) -> list[dict]:
+    with urllib.request.urlopen(local_url.rstrip("/") + "/agents", timeout=10) as response:
+        rows = json.loads(response.read())
+    return [json.loads(row) if isinstance(row, str) else row for row in rows]
+
+
+def _kali_agent(experiment: Experiment, agents: list[dict]) -> dict:
+    hosts = [host for host in _topology_hosts(experiment)
+             if _is_kali_vm(host.get("vm_type")) and not host.get("infrastructure")]
+    if len(hosts) != 1:
+        raise RuntimeError("Expected one Kali foothold in the topology")
+    host = hosts[0]
+    addresses = {host["ip_address"]} | {
+        interface["ip_address"] for interface in host.get("extra_interfaces", [])
+    }
+    matches = [agent for agent in agents
+               if addresses.intersection(agent["host_ip_addrs"])]
+    if len(matches) != 1:
+        raise RuntimeError(f"Expected one C2 agent on the Kali foothold; found {len(matches)}")
+    return matches[0]
+
+
+def _c2_diagnostic(experiment: Experiment, local_url: str, dest: Path) -> None:
+    try:
+        agent = _kali_agent(experiment, _c2_agents(local_url))
+        # Inspect only the selected foothold. Router observations come from console collection;
+        # diagnostic access must preserve the experiment's credential and network boundaries.
+        command = (
+            "timeout 10 sh -ec '"
+            "echo \"## ADDRESSES\"; ip -4 -o addr show; "
+            "echo \"## ROUTES\"; ip -4 route show; "
+            "echo \"## NEIGH\"; ip -4 neigh show; "
+            "echo \"## LISTENERS\"; ss -lntup; "
+            "echo \"## PROCESSES\"; ps -eo pid,ppid,user,args --sort=pid'"
+        )
+        request = urllib.request.Request(
+            local_url.rstrip("/") + "/send_manual_command",
+            data=json.dumps({"agent": agent["paw"], "command": command}).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=10) as response:
+            command_id = json.loads(response.read())["id"]
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            with urllib.request.urlopen(
+                    local_url.rstrip("/") + f"/command_status/{command_id}", timeout=10) as response:
+                state = json.loads(response.read())
+            if state["id"] != command_id:
+                raise RuntimeError("C2 returned a different diagnostic command")
+            if state["status"] in {"completed", "failed"}:
+                dest.write_text(json.dumps(state, indent=2) + "\n")
+                return
+            time.sleep(1)
+        dest.write_text(json.dumps({"id": command_id, "status": "pending",
+                                   "error": "Diagnostic polling expired; execution outcome is unknown"},
+                                  indent=2) + "\n")
+    except Exception as exc:
+        dest.write_text(json.dumps({"error": f"Diagnostic unavailable: {exc}"}, indent=2) + "\n")
+
+
 def verify_ready(experiment: Experiment, cfg: ExperimentManagerConfig) -> None:
     deployed = experiment.deployed_environment
     if not deployed or not deployed.project_name:
-        return
+        raise RuntimeError("readiness: deployed project is missing")
     project = deployed.project_name
-    ports = _openstack_json(["port", "list"]) or []
-    by_name = {p.get("Name"): p for p in ports if isinstance(p, dict)}
-    for host in _topology_hosts(experiment):
-        if host.get("infrastructure") or not host.get("name"):
-            continue
-        port = by_name.get(f"{project}-{host['name']}-nic-0")
-        if port is None:
-            raise RuntimeError(f"readiness: control port for {host['name']} is missing")
-        if port.get("Status") == "ACTIVE" or port.get("device_id"):
-            raise RuntimeError(f"readiness: control port for {host['name']} is still attached")
-    relay = next((h for h in _topology_hosts(experiment) if h.get("infrastructure")), None)
-    if relay:
-        port = by_name.get(f"{project}-{relay['name']}-nic-0")
-        if port is None or port.get("Status") != "ACTIVE":
-            raise RuntimeError("readiness: relay control port is not active")
-    # The console audit is supporting evidence; its absence is recorded, not treated as independent proof.
-    names = [h["name"] for h in _topology_hosts(experiment) if not h.get("infrastructure") and h.get("name")]
-    if names:
-        try:
-            r = subprocess.run(["openstack", "console", "log", "show", "--lines", "80",
-                                f"{project}-{names[0]}"], capture_output=True, text=True, timeout=60)
-            if "mhbench-console-audit" not in r.stdout:
-                log(experiment.experiment_name, "readiness: console audit marker not visible yet")
-        except Exception:
-            pass
-
-
-def verify_restoration(experiment: Experiment, cfg: ExperimentManagerConfig) -> None:
-    deployed = experiment.deployed_environment
-    if not deployed or not deployed.project_name:
-        return
-    project = deployed.project_name
-    ports = _openstack_json(["port", "list"]) or []
-    by_name = {p.get("Name"): p for p in ports if isinstance(p, dict)}
-    for host in _topology_hosts(experiment):
-        if host.get("infrastructure") or not host.get("name"):
-            continue
-        port = by_name.get(f"{project}-{host['name']}-nic-0")
-        if port is None or port.get("Status") != "ACTIVE":
-            raise RuntimeError(f"restoration: control port for {host['name']} is not active")
+    ports = _project_ports(_project_networks(experiment))
+    by_name = {port["name"]: port for port in ports}
+    hosts = _topology_hosts(experiment)
+    for host in hosts:
+        if host.get("infrastructure"):
+            port = by_name.get(f"{project}-{host['name']}-nic-0")
+            if port is None or port["status"] != "ACTIVE" or not port["device_id"]:
+                raise RuntimeError("readiness: relay control port is inactive or unbound")
+        else:
+            port = by_name.get(f"{project}-{host['name']}-nic-0")
+            if port is None:
+                raise RuntimeError(f"readiness: control port for {host['name']} is missing")
+            if port["status"] != "DOWN" or port["device_id"]:
+                raise RuntimeError(f"readiness: control port for {host['name']} is still attached")
+    data_cidrs = _data_cidrs(experiment)
+    data_ports = {
+        port["id"] for port in ports
+        if any(ipaddress.ip_address(fixed["ip_address"]) in cidr
+               for fixed in port["fixed_ips"] for cidr in data_cidrs)
+    }
+    for port in ports:
+        if port["id"] in data_ports and port["device_owner"].startswith("network:router"):
+            raise RuntimeError(f"readiness: router port {port['id']} is attached to a data subnet")
+    for fip in _openstack_json(["floating", "ip", "list"], rows=True):
+        if fip["Port"] in data_ports:
+            raise RuntimeError(f"readiness: data port {fip['Port']} has a floating IP")
+    local_url = _c2_local_url(experiment)
+    if not local_url:
+        raise RuntimeError("readiness: no C2 operator tunnel is available")
+    _kali_agent(experiment, _c2_agents(local_url))
 
 
 def capture_attack_state(experiment: Experiment, cfg: ExperimentManagerConfig) -> None:
     deployed = experiment.deployed_environment
+    project = deployed.project_name if deployed else None
     out = output_root(experiment.experiment_name, cfg) / experiment.experiment_name / "attack_state"
     out.mkdir(parents=True, exist_ok=True)
-    for name, args in (
-        ("servers", ["server", "list"]),
-        ("ports", ["port", "list"]),
-        ("routers", ["router", "list"]),
-        ("subnets", ["subnet", "list"]),
-        ("security_groups", ["security", "group", "list"]),
-    ):
-        data = _openstack_json(args)
-        if data is not None:
-            (out / f"{name}.json").write_text(json.dumps(data, indent=2) + "\n")
-    if deployed and deployed.project_name:
-        for host in _topology_hosts(experiment):
-            name = host.get("name")
-            if not name:
-                continue
-            try:
-                r = subprocess.run(["openstack", "console", "log", "show", "--lines", "200",
-                                    f"{deployed.project_name}-{name}"],
-                                   capture_output=True, text=True, timeout=60)
-                if r.returncode == 0:
-                    (out / f"console-{name}.log").write_text(r.stdout)
-            except Exception:
-                continue
-    prepared = getattr(experiment, "_attacker_prepared", None)
-    local_url = getattr(prepared, "local_url", None) if prepared else None
+
+    def record(name, read):
+        try:
+            data = read()
+        except Exception as exc:
+            data = {"error": str(exc)}
+        (out / f"{name}.json").write_text(json.dumps(data, indent=2) + "\n")
+        return data
+
+    networks = record("networks", lambda: _project_networks(experiment))
+    ports = record("ports", lambda: _project_ports(networks))
+
+    def port_ids(field: str) -> set[str]:
+        if not isinstance(ports, list):
+            raise RuntimeError("Owned-port observation is unavailable")
+        return {port[field] for port in ports if port[field]}
+
+    def associated(kind: str, ids: set[str], names: set[str]) -> list[dict]:
+        return [row for row in _openstack_json([kind, "list"], rows=True)
+                if row["ID"] in ids or row["Name"] in names]
+
+    names = {f"{project}-{host['name']}" for host in _topology_hosts(experiment)}
+    names.add(f"{project}-management_host")
+    record("servers", lambda: associated("server", port_ids("device_id"), names))
+    record("routers", lambda: associated("router", port_ids("device_id"), {f"{project}-router"}))
+
+    def subnets():
+        if not isinstance(networks, list):
+            raise RuntimeError("Owned-network observation is unavailable")
+        return [_openstack_json(["subnet", "show", subnet_id])
+                for subnet_id in sorted({subnet_id for network in networks
+                                         for subnet_id in network["subnets"]})]
+
+    def security_groups():
+        if not isinstance(ports, list):
+            raise RuntimeError("Owned-port observation is unavailable")
+        return [_openstack_json(["security", "group", "show", group_id])
+                for group_id in sorted({group_id for port in ports
+                                        for group_id in port["security_group_ids"]})]
+
+    record("subnets", subnets)
+    record("security_groups", security_groups)
+
+    def floating_ips():
+        ids = port_ids("id")
+        return [row for row in _openstack_json(["floating", "ip", "list"], rows=True)
+                if row["Port"] in ids]
+
+    record("floating_ips", floating_ips)
+    for host in _topology_hosts(experiment):
+        name = host["name"]
+        try:
+            result = subprocess.run(
+                ["openstack", "console", "log", "show", "--lines", "200", f"{project}-{name}"],
+                capture_output=True, text=True, timeout=60)
+            if result.returncode:
+                raise RuntimeError(result.stderr.strip())
+            (out / f"console-{name}.log").write_text(result.stdout)
+        except Exception as exc:
+            (out / f"console-{name}.log").write_text(f"Console unavailable: {exc}\n")
+    local_url = _c2_local_url(experiment)
     if local_url:
         for name, path in (("c2_agents", "/agents"), ("c2_logs", "/get_latest_logs")):
-            try:
-                with urllib.request.urlopen(local_url.rstrip("/") + path, timeout=10) as r:
-                    (out / f"{name}.json").write_bytes(r.read())
-            except Exception:
-                continue
+            def read(path=path):
+                with urllib.request.urlopen(local_url.rstrip("/") + path, timeout=10) as response:
+                    return json.loads(response.read())
+            record(name, read)
+        _c2_diagnostic(experiment, local_url, out / "c2-kali-state.txt")
+    else:
+        for name in ("c2_agents", "c2_logs"):
+            record(name, lambda: {"error": "C2 operator tunnel is unavailable"})
 
 
 async def configure_environment(
