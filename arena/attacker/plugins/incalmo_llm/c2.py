@@ -31,6 +31,7 @@ _built_image: str | None = None
 STARTUP_TIMEOUT = 60
 AGENT_BEACON_TIMEOUT = 600
 POLL_INTERVAL = 2
+_TUNNEL_SCRIPT = '\nimport json, os, select, shlex, socket, subprocess, sys, threading\n\naccess = json.loads(sys.argv[2])\nlocal_port = int(sys.argv[1])\nlistener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\nlistener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\nlistener.bind(("127.0.0.1", local_port))\nlistener.listen(16)\n\ndef handle(conn):\n    argv = ["ssh"]\n    if access.get("ssh_key"):\n        argv += ["-i", os.path.expanduser(access["ssh_key"])]\n    argv += ["-p", str(access.get("port", 22)),\n             "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",\n             "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=15"]\n    if access.get("ssh_common_args"):\n        argv += shlex.split(access["ssh_common_args"])\n    argv += [f"{access.get(\'user\', \'root\')}@{access[\'host\']}", "127.0.0.1", "8888"]\n    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,\n                            stderr=subprocess.DEVNULL)\n    try:\n        while True:\n            readable, _, _ = select.select([conn, proc.stdout], [], [], 300)\n            if not readable:\n                break\n            if conn in readable:\n                data = conn.recv(65536)\n                if not data:\n                    break\n                proc.stdin.write(data); proc.stdin.flush()\n            if proc.stdout in readable:\n                data = os.read(proc.stdout.fileno(), 65536)\n                if not data:\n                    break\n                conn.sendall(data)\n    finally:\n        try: proc.kill()\n        except Exception: pass\n        conn.close()\n\nwhile True:\n    conn, _ = listener.accept()\n    threading.Thread(target=handle, args=(conn,), daemon=True).start()\n'
 
 
 def _statefile(experiment_name: str) -> Path:
@@ -109,6 +110,7 @@ def setup_c2(experiment_name: str, cfg, access: AttackerSetupAccess, bastion_ip:
     if access is None or not access.host:
         raise RuntimeError(f"[foothold-c2] need a foothold AttackerSetupAccess with a host (got {access!r})")
     foothold_ip = access.host
+    service_host = access.service_host or foothold_ip
     _STATE_DIR.mkdir(parents=True, exist_ok=True)
     ctl = _ctl_path(experiment_name)
     ssh = _ssh_to_foothold(access, ctl)
@@ -160,7 +162,7 @@ def setup_c2(experiment_name: str, cfg, access: AttackerSetupAccess, bastion_ip:
         logger.warning("[foothold-c2] old C2 image removal on %s: %s", foothold_ip,
                        (old.stderr or old.stdout).strip()[:300])
 
-    start_c2_image(experiment_name, image_id, ssh)
+    start_c2_image(experiment_name, image_id, ssh, f"http://{service_host}:{_C2_PORT}")
     # The foothold may ship a default-deny host firewall; the victim-side agent
     # download uses the C2 port directly, so admit it before the tunnel check.
     subprocess.run(ssh + [
@@ -172,32 +174,45 @@ def setup_c2(experiment_name: str, cfg, access: AttackerSetupAccess, bastion_ip:
 
     _close_master(access, ctl)
 
+    tunnel_access = access
+    if access.tunnel_user and access.tunnel_key:
+        tunnel_access = access.model_copy(update={
+            "user": access.tunnel_user,
+            "ssh_key": access.tunnel_key,
+            "ssh_common_args": access.tunnel_ssh_common_args or access.ssh_common_args,
+        })
     local_port = _free_local_port()
-    ssh_tunnel = [
-        "ssh", "-N", "-o", "ExitOnForwardFailure=yes",
-        "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=6", "-o", "TCPKeepAlive=yes",
-        "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=15",
-        "-p", str(access.port),
-    ]
-    if access.ssh_key:
-        ssh_tunnel += ["-i", os.path.expanduser(access.ssh_key)]
-    if access.ssh_common_args:
-        ssh_tunnel += shlex.split(access.ssh_common_args)
-    ssh_tunnel += [
-        "-L", f"127.0.0.1:{local_port}:{foothold_ip}:{_C2_PORT}",
-        f"{access.user}@{access.host}",
-    ]
-    supervisor = "while true; do " + " ".join(shlex.quote(a) for a in ssh_tunnel) + "; sleep 2; done"
-    tunnel = subprocess.Popen(["bash", "-c", supervisor],
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                              start_new_session=True)
+    if tunnel_access.user == access.user and tunnel_access.ssh_key == access.ssh_key:
+        # Compatibility fallback for older access entries: one SSH local-forward tunnel.
+        ssh_tunnel = [
+            "ssh", "-N", "-o", "ExitOnForwardFailure=yes",
+            "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=6", "-o", "TCPKeepAlive=yes",
+            "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=15",
+            "-p", str(access.port),
+        ]
+        if access.ssh_key:
+            ssh_tunnel += ["-i", os.path.expanduser(access.ssh_key)]
+        if access.ssh_common_args:
+            ssh_tunnel += shlex.split(access.ssh_common_args)
+        ssh_tunnel += ["-L", f"127.0.0.1:{local_port}:127.0.0.1:{_C2_PORT}",
+                       f"{access.user}@{access.host}"]
+        supervisor = "while true; do " + " ".join(shlex.quote(a) for a in ssh_tunnel) + "; sleep 2; done"
+        tunnel = subprocess.Popen(["bash", "-c", supervisor],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  start_new_session=True)
+    else:
+        # Forced-proxy path: a local TCP listener spawns one exact-destination SSH proxy
+        # session per connection. No SSH forwarding is used on the relay.
+        tunnel = subprocess.Popen(
+            ["python3", "-c", _TUNNEL_SCRIPT, str(local_port), json.dumps(tunnel_access.model_dump()), "mhbench-c2-tunnel"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     _statefile(experiment_name).write_text(json.dumps({
         "tunnel_pid": tunnel.pid, "foothold_ip": foothold_ip, "mgmt_ip": bastion_ip, "local_port": local_port,
-        "access": access.model_dump(),
+        "access": access.model_dump(), "tunnel_access": tunnel_access.model_dump(),
     }))
-    logger.info("[foothold-c2] resilient tunnel supervisor pid=%s 127.0.0.1:%s -> %s:%s (via %s)",
-                tunnel.pid, local_port, foothold_ip, _C2_PORT, bastion_ip)
+    logger.info("[foothold-c2] tunnel supervisor pid=%s 127.0.0.1:%s -> relay-loopback:%s (via %s)",
+                tunnel.pid, local_port, _C2_PORT, bastion_ip)
 
     url = f"http://127.0.0.1:{local_port}/agents"
     for _ in range(48):
@@ -211,7 +226,7 @@ def setup_c2(experiment_name: str, cfg, access: AttackerSetupAccess, bastion_ip:
         raise RuntimeError(f"[foothold-c2] C2 never served on {url} (container/tunnel not ready)")
 
     return (f"foothold-c2:{experiment_name}",
-            f"http://{foothold_ip}:{_C2_PORT}",
+            f"http://{service_host}:{_C2_PORT}",
             f"http://127.0.0.1:{local_port}")
 
 
@@ -279,7 +294,7 @@ def sweep_stale_tunnels() -> None:
                     cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
                 except Exception:
                     cmdline = ""
-                if "-L 127.0.0.1:" in cmdline and f":{_C2_PORT}" in cmdline:
+                if ("mhbench-c2-tunnel" in cmdline) or ("-L 127.0.0.1:" in cmdline and f":{_C2_PORT}" in cmdline):
                     _kill_pid(pid)
             sf.unlink()
         except Exception:

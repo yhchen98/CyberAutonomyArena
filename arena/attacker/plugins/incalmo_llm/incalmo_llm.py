@@ -144,8 +144,11 @@ class IncalmoLLMAttacker(AttackerPlugin, config_type="incalmo_llm"):
         foothold_access = self.primary_access(access) if access else None
         if foothold_access is None:
             raise RuntimeError("the Incalmo C2 runs on the attacker foothold, but setup() got no AttackerSetupAccess")
+        # The C2 server runs on the dedicated infrastructure relay, not on the Kali foothold.
+        # Its access carries the relay's control host and attacker-facing service_host.
+        c2_access = next((a for a in access if a.name == "c2"), foothold_access)
         _sentinel, remote_url, local_url = await self.launch_c2c(
-            experiment.experiment_name, cfg, bastion_ip, foothold_access=foothold_access)
+            experiment.experiment_name, cfg, bastion_ip, foothold_access=c2_access)
         try:
             if local_url:
                 await self.wait_c2c_ready(local_url, experiment.experiment_name)
@@ -159,10 +162,11 @@ class IncalmoLLMAttacker(AttackerPlugin, config_type="incalmo_llm"):
 
     async def prepare_foothold(self, experiment, cfg: ExperimentManagerConfig, bastion_ip, remote_url, access=None):
         """Prepare Sandcat and the selected abstraction's dependencies."""
-        access = _require_access(access)
-        await foothold.land_sandcat(access, remote_url, cfg, experiment.experiment_name)
+        accounts = _require_access(access)
+        foothold_access = next((a for a in accounts if a.name != "c2"), accounts[0])
+        await foothold.land_sandcat([foothold_access], remote_url, cfg, experiment.experiment_name)
         if self.abstraction == "low_level_actions":
-            await install_metasploit(access, cfg, experiment.experiment_name)
+            await install_metasploit([foothold_access], cfg, experiment.experiment_name)
 
     async def launch_c2c(
         self, experiment_name: str, cfg: ExperimentManagerConfig, bastion_ip: Optional[str] = None,

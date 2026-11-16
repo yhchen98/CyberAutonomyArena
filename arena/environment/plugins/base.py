@@ -62,6 +62,26 @@ class EnvironmentPlugin(BaseModel):
         """Pull host logs into the experiment's output tree before teardown. Best-effort."""
         raise NotImplementedError(f"{type(self).__name__} must implement collect()")
 
+    async def seal(self, experiment: "Experiment", cfg: ExperimentManagerConfig) -> dict:
+        """Detach experimental control-plane access before an attack. Default: no-op."""
+        return {}
+
+    async def restore(self, experiment: "Experiment", cfg: ExperimentManagerConfig) -> dict:
+        """Reattach control-plane access after an attack. Default: no-op."""
+        return {}
+
+    async def capture_attack_state(self, experiment: "Experiment", cfg: ExperimentManagerConfig) -> None:
+        """Capture read-only final sealed state before restoration. Default: no-op."""
+        return None
+
+    async def verify_ready(self, experiment: "Experiment", cfg: ExperimentManagerConfig) -> None:
+        """Minimal non-intrusive pre-attack readiness check. Default: no-op."""
+        return None
+
+    async def verify_restoration(self, experiment: "Experiment", cfg: ExperimentManagerConfig) -> None:
+        """Post-restore management reachability check. Default: no-op."""
+        return None
+
     @classmethod
     async def clean_slate(cls, cfg: ExperimentManagerConfig) -> None:
         """Reset this backend's global state at manager startup. Default: no-op. Must be best-effort."""

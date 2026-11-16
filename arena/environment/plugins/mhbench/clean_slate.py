@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 
@@ -116,6 +117,13 @@ async def openstack_clean_slate() -> None:
             logger.warning("Batch port delete reported a failure")
 
     logger.info("=== Deleting internal subnets ===")
+    external_subnet_ids: set[str] = set()
+    for nid in external_net_ids:
+        try:
+            network = json.loads(await _run("network", "show", nid, "-f", "json") or "{}")
+            external_subnet_ids.update(network.get("subnets", []))
+        except (ValueError, TypeError):
+            continue
     subnet_raw = await _run("subnet", "list", "-f", "value", "-c", "ID", "-c", "Name")
     for line in subnet_raw.splitlines():
         parts = line.split(None, 1)
@@ -123,8 +131,8 @@ async def openstack_clean_slate() -> None:
             continue
         sid = parts[0]
         sname = parts[1] if len(parts) > 1 else ""
-        if "external" in sname.lower():
-            logger.warning("Skipping external subnet: %s (%s)", sname, sid)
+        if sid in external_subnet_ids or "public" in sname.lower() or "external" in sname.lower():
+            logger.warning("Skipping external-network subnet: %s (%s)", sname, sid)
             continue
         logger.info("Deleting subnet %s (%s)", sname, sid)
         if not await _exec("subnet", "delete", sid):

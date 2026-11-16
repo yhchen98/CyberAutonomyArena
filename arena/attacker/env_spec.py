@@ -77,6 +77,14 @@ class AttackerSetupAccess(BaseModel):
     port: int = 22
     ssh_key: Optional[str] = None
     ssh_common_args: str = ""
+    # For the C2 relay access entry: the attacker-facing data address, distinct from the control
+    # address used for setup/teardown. Empty for an ordinary foothold access.
+    service_host: Optional[str] = None
+    # For the C2 relay: the forced-proxy account/key used for the harness C2 tunnel, separate from
+    # the relay admin account used to install and inspect the container.
+    tunnel_user: Optional[str] = None
+    tunnel_key: Optional[str] = None
+    tunnel_ssh_common_args: str = ""
 
     def ssh_base(self) -> list[str]:
         """An ssh command prefix that runs a remote command on this box."""
