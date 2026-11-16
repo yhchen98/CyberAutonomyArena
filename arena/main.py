@@ -358,8 +358,10 @@ async def _shutdown_cleanup() -> None:
     logging.shutdown()
 
 
-async def _teardown(experiment: Experiment, delete_c2: bool = True) -> bool:  # True iff the env was cleanly destroyed
-    if not experiment.teardown:
+async def _teardown(experiment: Experiment, delete_c2: bool = True, *, force: bool = False) -> bool:  # True iff the env was cleanly destroyed
+    isolated = bool(getattr(experiment, "_isolation_enabled", False))
+    preserve = not experiment.teardown and not force
+    if preserve and not isolated:
         get_logger(experiment.experiment_name).info(
             "teardown=False — preserving environment + C2 for '%s'", experiment.experiment_name
         )
@@ -367,24 +369,42 @@ async def _teardown(experiment: Experiment, delete_c2: bool = True) -> bool:  # 
     experiment.teardown_started_at = datetime.now(timezone.utc)
     await registry.update(experiment)
 
-    # Restore the experimental control plane before management-dependent collection. The C2
-    # relay's control path is retained throughout sealing; all other control ports are reattached.
-    # Read-only final attack-state evidence must precede restoration. Provider state and a
-    # bounded console tail are independent of the guest-controlled console reporter.
-    try:
-        await experiment.environment.capture_attack_state(experiment, cfg)
-    except Exception:
-        get_logger(experiment.experiment_name).exception(
-            "Attack-state capture failed for '%s'", experiment.experiment_name)
-
-    if getattr(experiment, "_seal_attempted", False):
+    if isolated:
+        # Read-only final attack-state evidence precedes restoration. Provider state and a bounded
+        # console tail are independent of the guest-controlled console reporter.
+        capture = getattr(experiment, "_attack_state_capture", None)
+        if capture is None:
+            capture = asyncio.create_task(experiment.environment.capture_attack_state(experiment, cfg))
+            experiment._attack_state_capture = capture
         try:
-            await experiment.environment.restore(experiment, cfg)
-            experiment._sealed = False
-            await experiment.environment.verify_restoration(experiment, cfg)
+            await asyncio.shield(capture)
         except Exception:
             get_logger(experiment.experiment_name).exception(
-                "Failed to restore control plane for '%s'", experiment.experiment_name)
+                "Attack-state capture failed for '%s'", experiment.experiment_name)
+        if getattr(experiment, "_seal_attempted", False):
+            try:
+                await experiment.environment.restore(experiment, cfg)
+                experiment._sealed = False
+                await experiment.environment.verify_restoration(experiment, cfg)
+            except Exception as exc:
+                experiment._restoration_failed = True
+                message = f"Control-plane restoration failed — {exc}"
+                experiment.error = f"{experiment.error}; {message}" if experiment.error else message
+                get_logger(experiment.experiment_name).exception(
+                    "Failed to restore control plane for '%s'", experiment.experiment_name)
+
+    if preserve:
+        get_logger(experiment.experiment_name).info(
+            "teardown=False — preserving environment + C2 for '%s'", experiment.experiment_name
+        )
+        return False
+
+    # Non-isolated environments preserve the original ordering: stop C2 before host collection.
+    if not isolated and experiment.attacker and delete_c2:
+        try:
+            await experiment.attacker.teardown(experiment.experiment_name, cfg)
+        except Exception:
+            get_logger(experiment.experiment_name).exception("Failed to stop C2 for '%s'", experiment.experiment_name)
 
     # Pull host logs while the range is still up, under _collect_lock. Best-effort: never block teardown.
     try:
@@ -412,9 +432,9 @@ async def _teardown(experiment: Experiment, delete_c2: bool = True) -> bool:  # 
         except Exception:
             get_logger(experiment.experiment_name).exception("Defender-log collection failed for '%s'", experiment.experiment_name)
 
-    # Stop the C2 only after all host/attacker/defender evidence has been collected. The C2
-    # container and its tunnel are infrastructure, not attack-effect cleanup.
-    if experiment.attacker and delete_c2:
+    # For isolated runs, the C2 is infrastructure: keep it available through attack-state capture,
+    # restoration, and collection, then stop it.
+    if isolated and experiment.attacker and delete_c2:
         try:
             await experiment.attacker.teardown(experiment.experiment_name, cfg)
         except Exception:
@@ -521,27 +541,39 @@ async def _cancel_and_remove(name: str) -> None:
         except Exception:
             cleanup_failed = True
             logger.exception("Failed to stop attacker process for '%s'", name)
+    if getattr(experiment, "_isolation_enabled", False):
+        # Explicit removal destroys preserved deployments too, after the isolated final-state flow.
+        if not await _teardown(experiment, force=True):
+            cleanup_failed = True
+    else:
+        if experiment.attacker:
+            try:
+                await experiment.attacker.teardown(experiment.experiment_name, cfg)
+            except Exception:
+                cleanup_failed = True
+                logger.exception("Failed to stop C2 for '%s'", name)
+        if experiment.defender:
+            try:
+                await experiment.defender.teardown(experiment.experiment_name, cfg)
+            except Exception:
+                cleanup_failed = True
+                logger.exception("Defender teardown failed for '%s'", name)
         try:
-            await experiment.attacker.teardown(experiment.experiment_name, cfg)
+            await experiment.environment.teardown(experiment, cfg, lc=_env_lc(experiment, EnvironmentCommand.TEARDOWN))
         except Exception:
             cleanup_failed = True
-            logger.exception("Failed to stop C2 for '%s'", name)
-    if experiment.defender:
-        try:
-            await experiment.defender.teardown(experiment.experiment_name, cfg)
-        except Exception:
-            cleanup_failed = True
-            logger.exception("Defender teardown failed for '%s'", name)
-    try:
-        await experiment.environment.teardown(experiment, cfg, lc=_env_lc(experiment, EnvironmentCommand.TEARDOWN))
-    except Exception:
-        cleanup_failed = True
-        logger.exception("Failed to tear down environment for '%s'", name)
-    if experiment.status in _ACTIVE_STATUSES:
-        experiment.status = ExperimentStatus.ERROR if cleanup_failed else ExperimentStatus.CANCELLED
-        experiment.error = "Cancellation cleanup failed; see manager log" if cleanup_failed else "Cancelled by manager"
+            logger.exception("Failed to tear down environment for '%s'", name)
+    if experiment.status in _ACTIVE_STATUSES or cleanup_failed:
+        failed = cleanup_failed or getattr(experiment, "_restoration_failed", False)
+        experiment.status = ExperimentStatus.ERROR if failed else ExperimentStatus.CANCELLED
+        if cleanup_failed:
+            experiment.error = "Cancellation cleanup failed; see manager log"
+        elif not failed:
+            experiment.error = "Cancelled by manager"
         await registry.update(experiment)
         _write_result(experiment)
+    if cleanup_failed:
+        raise RuntimeError(f"Cancellation cleanup failed for {name}; keeping the registered experiment")
     close_loggers(name)
     await registry.remove(name)
     _capacity.release(name)
@@ -818,20 +850,29 @@ async def _run_experiment(experiment: Experiment) -> None:
                 await _handle_failure(experiment, f"Failed to start defender — {e}")
                 return
 
-    # Seal the experimental control plane after all setup and before any attack action. The
-    # C2 relay's control interface (when present) remains the only infrastructure path.
+    # Seal the experimental control plane after all setup and before any attack action. Only
+    # isolated BGP environments opt in; all other environments retain their existing behavior.
     experiment._bastion_ip = bastion_ip
-    experiment._seal_attempted = True
     try:
-        await experiment.environment.seal(experiment, cfg)
-        experiment._sealed = True
-        await experiment.environment.verify_ready(experiment, cfg)
+        experiment._isolation_enabled = await experiment.environment.isolation_enabled(experiment, cfg)
     except Exception as e:
-        exp_log.exception("Seal/readiness failed for '%s'", experiment.experiment_name)
+        exp_log.exception("Failed to determine isolation mode for '%s'", experiment.experiment_name)
         if defender_process:
             await _stop_defender_process(experiment, defender_process, cfg)
-        await _handle_failure(experiment, f"Seal/readiness failed — {e}")
+        await _handle_failure(experiment, f"Failed to determine isolation mode — {e}")
         return
+    if experiment._isolation_enabled:
+        experiment._seal_attempted = True
+        try:
+            await experiment.environment.seal(experiment, cfg)
+            experiment._sealed = True
+            await experiment.environment.verify_ready(experiment, cfg)
+        except Exception as e:
+            exp_log.exception("Seal/readiness failed for '%s'", experiment.experiment_name)
+            if defender_process:
+                await _stop_defender_process(experiment, defender_process, cfg)
+            await _handle_failure(experiment, f"Seal/readiness failed — {e}")
+            return
 
     try:
         await attacker_lc.send(AttackerCommand.START_RUN)
@@ -911,6 +952,8 @@ async def _run_experiment(experiment: Experiment) -> None:
 
     # Flip to a terminal status only after _teardown, which collects all host telemetry before deleting VMs.
     tore_down = await _teardown(experiment)
+    if getattr(experiment, "_restoration_failed", False):
+        status = ExperimentStatus.ERROR
     if experiment.teardown and not tore_down:
         experiment.error = f"Environment teardown failed after attacker outcome {status.value}"
         status = ExperimentStatus.ERROR

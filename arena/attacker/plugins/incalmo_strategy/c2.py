@@ -16,6 +16,7 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
+from ..c2_tunnel import TUNNEL_MARKER, start_tunnel
 from ..incalmo_image import start_c2_image
 from ...env_spec import AttackerSetupAccess
 from ....config import ExperimentManagerConfig
@@ -32,8 +33,6 @@ _built_image: str | None = None
 STARTUP_TIMEOUT = 60
 AGENT_BEACON_TIMEOUT = 600  # the first beacon can lag, so allow a wide margin
 POLL_INTERVAL = 2
-_TUNNEL_SCRIPT = '\nimport json, os, select, shlex, socket, subprocess, sys, threading\n\naccess = json.loads(sys.argv[2])\nlocal_port = int(sys.argv[1])\nlistener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\nlistener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\nlistener.bind(("127.0.0.1", local_port))\nlistener.listen(16)\n\ndef handle(conn):\n    argv = ["ssh"]\n    if access.get("ssh_key"):\n        argv += ["-i", os.path.expanduser(access["ssh_key"])]\n    argv += ["-p", str(access.get("port", 22)),\n             "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",\n             "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=15"]\n    if access.get("ssh_common_args"):\n        argv += shlex.split(access["ssh_common_args"])\n    argv += [f"{access.get(\'user\', \'root\')}@{access[\'host\']}", "127.0.0.1", "8888"]\n    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,\n                            stderr=subprocess.DEVNULL)\n    try:\n        while True:\n            readable, _, _ = select.select([conn, proc.stdout], [], [], 300)\n            if not readable:\n                break\n            if conn in readable:\n                data = conn.recv(65536)\n                if not data:\n                    break\n                proc.stdin.write(data); proc.stdin.flush()\n            if proc.stdout in readable:\n                data = os.read(proc.stdout.fileno(), 65536)\n                if not data:\n                    break\n                conn.sendall(data)\n    finally:\n        try: proc.kill()\n        except Exception: pass\n        conn.close()\n\nwhile True:\n    conn, _ = listener.accept()\n    threading.Thread(target=handle, args=(conn,), daemon=True).start()\n'
-
 
 def _statefile(experiment_name: str) -> Path:
     return _STATE_DIR / f"{experiment_name}.json"
@@ -224,9 +223,7 @@ def setup_c2(experiment_name: str, cfg, access: AttackerSetupAccess, bastion_ip:
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                   start_new_session=True)
     else:
-        tunnel = subprocess.Popen(
-            ["python3", "-c", _TUNNEL_SCRIPT, str(local_port), json.dumps(tunnel_access.model_dump()), "mhbench-c2-tunnel"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        tunnel = start_tunnel(local_port, tunnel_access)
     _statefile(experiment_name).write_text(json.dumps({
         "tunnel_pid": tunnel.pid, "foothold_ip": foothold_ip, "mgmt_ip": bastion_ip, "local_port": local_port,
         "access": access.model_dump(), "tunnel_access": tunnel_access.model_dump(),
@@ -315,7 +312,7 @@ def sweep_stale_tunnels() -> None:
                     cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
                 except Exception:
                     cmdline = ""
-                if ("mhbench-c2-tunnel" in cmdline) or ("-L 127.0.0.1:" in cmdline and f":{_C2_PORT}" in cmdline):
+                if (TUNNEL_MARKER in cmdline) or ("-L 127.0.0.1:" in cmdline and f":{_C2_PORT}" in cmdline):
                     _kill_pid(pid)
             sf.unlink()
         except Exception:

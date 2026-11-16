@@ -62,6 +62,10 @@ class EnvironmentPlugin(BaseModel):
         """Pull host logs into the experiment's output tree before teardown. Best-effort."""
         raise NotImplementedError(f"{type(self).__name__} must implement collect()")
 
+    async def isolation_enabled(self, experiment: "Experiment", cfg: ExperimentManagerConfig) -> bool:
+        """True only for environments that explicitly opt into management isolation. Default: no."""
+        return False
+
     async def seal(self, experiment: "Experiment", cfg: ExperimentManagerConfig) -> dict:
         """Detach experimental control-plane access before an attack. Default: no-op."""
         return {}

@@ -97,28 +97,45 @@ class MHBenchEnvironment(EnvironmentPlugin, config_type="mhbench"):
         if lc:
             lc.emit(EnvironmentSignal.CONFIGURED)
 
+    async def isolation_enabled(self, experiment: "Experiment", cfg: ExperimentManagerConfig) -> bool:
+        from .deployer import topology_isolation
+        return await asyncio.to_thread(topology_isolation, self.environment_spec, cfg)
+
     async def seal(self, experiment: "Experiment", cfg: ExperimentManagerConfig) -> dict:
         from .deployer import run_control_plane_lifecycle
+        if not await self.isolation_enabled(experiment, cfg):
+            return {}
         return await asyncio.to_thread(
             run_control_plane_lifecycle, experiment.experiment_name,
             self.environment_spec, cfg, "seal", getattr(experiment, "_bastion_ip", None))
 
     async def restore(self, experiment: "Experiment", cfg: ExperimentManagerConfig) -> dict:
         from .deployer import run_control_plane_lifecycle
+        if not await self.isolation_enabled(experiment, cfg):
+            return {}
         return await asyncio.to_thread(
             run_control_plane_lifecycle, experiment.experiment_name,
             self.environment_spec, cfg, "restore")
 
     async def verify_ready(self, experiment: "Experiment", cfg: ExperimentManagerConfig) -> None:
         from .deployer import verify_ready as _verify_ready
+        if not await self.isolation_enabled(experiment, cfg):
+            return
         await asyncio.to_thread(_verify_ready, experiment, cfg)
 
     async def verify_restoration(self, experiment: "Experiment", cfg: ExperimentManagerConfig) -> None:
-        from .deployer import verify_restoration as _verify_restoration
-        await asyncio.to_thread(_verify_restoration, experiment, cfg)
+        from .deployer import run_control_plane_lifecycle
+        if not await self.isolation_enabled(experiment, cfg):
+            return
+        await asyncio.to_thread(
+            run_control_plane_lifecycle, experiment.experiment_name,
+            self.environment_spec, cfg, "verify-restoration",
+            getattr(experiment, "_bastion_ip", None))
 
     async def capture_attack_state(self, experiment: "Experiment", cfg: ExperimentManagerConfig) -> None:
         from .deployer import capture_attack_state as _capture
+        if not await self.isolation_enabled(experiment, cfg):
+            return
         await asyncio.to_thread(_capture, experiment, cfg)
 
     async def collect(self, experiment: "Experiment", cfg: ExperimentManagerConfig) -> None:
