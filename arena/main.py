@@ -174,6 +174,7 @@ _deploy_buffer: asyncio.Semaphore
 _inflight_gate: _PriorityLock  # caps concurrently-active experiments, priority-ordered
 _capacity: CapacityTracker
 _tasks: dict[str, asyncio.Task] = {}  # experiment_name -> its _run_experiment task
+_removal_tasks: dict[str, asyncio.Task[None]] = {}
 
 
 @asynccontextmanager
@@ -262,6 +263,11 @@ async def _clean_slate() -> None:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
     _tasks.clear()
+    await asyncio.gather(*_removal_tasks.values(), return_exceptions=True)
+    await asyncio.gather(
+        *(e._teardown_task for e in registry.load() if hasattr(e, "_teardown_task")),
+        return_exceptions=True,
+    )
     # Reap leftover MHBench/ansible subprocesses from a prior harness. Skip the GCP manager's tree.
     for pattern in ("MHBench/cli.py", "ansible"):
         try:
@@ -358,7 +364,18 @@ async def _shutdown_cleanup() -> None:
     logging.shutdown()
 
 
-async def _teardown(experiment: Experiment, delete_c2: bool = True, *, force: bool = False) -> bool:  # True iff the env was cleanly destroyed
+async def _teardown(experiment: Experiment, delete_c2: bool = True, *, force: bool = False) -> bool:
+    if experiment.teardown_finished_at is not None:
+        return True
+    task = getattr(experiment, "_teardown_task", None)
+    if task is None or task.done():
+        task = asyncio.create_task(_run_teardown(experiment, delete_c2, force=force))
+        experiment._teardown_task = task
+    # Executor-backed backend operations can outlive cancellation of their caller.
+    return await asyncio.shield(task)
+
+
+async def _run_teardown(experiment: Experiment, delete_c2: bool, *, force: bool) -> bool:
     isolated = bool(getattr(experiment, "_isolation_enabled", False))
     preserve = not experiment.teardown and not force
     if preserve and not isolated:
@@ -514,18 +531,50 @@ async def _handle_failure(experiment: Experiment, reason: Optional[str] = None) 
 
 
 async def _cancel_and_remove(name: str) -> None:
-    """Cancel one experiment and free its name: stop its task, subprocess, attacker, C2, and VMs by name."""
+    """Share one cleanup between overlapping removal requests for the same experiment."""
+    removal = _removal_tasks.get(name)
+    if removal is None:
+        removal = asyncio.create_task(_remove_experiment(name))
+        _removal_tasks[name] = removal
+        removal.add_done_callback(lambda _: _removal_tasks.pop(name))
+    await asyncio.shield(removal)
+
+
+async def _remove_experiment(name: str) -> None:
     task = _tasks.pop(name, None)
     if task and not task.done():
         task.cancel()
-        try:
-            await task
-        except BaseException:
-            pass
+        await asyncio.gather(task, return_exceptions=True)
     try:
         experiment = registry.get(name)
     except KeyError:
         return
+    # Let any cleanup from normal completion, failure, or timeout finish before the process sweep.
+    teardown = getattr(experiment, "_teardown_task", None)
+    if teardown is not None:
+        await asyncio.gather(teardown, return_exceptions=True)
+    cleanup_failed = False
+    if experiment.teardown_finished_at is None:
+        cleanup_failed = await _remove_resources(experiment)
+    if experiment.status in _ACTIVE_STATUSES or cleanup_failed:
+        failed = cleanup_failed or getattr(experiment, "_restoration_failed", False)
+        experiment.status = ExperimentStatus.ERROR if failed else ExperimentStatus.CANCELLED
+        if cleanup_failed:
+            experiment.error = "Cancellation cleanup failed; see manager log"
+        elif not failed:
+            experiment.error = "Cancelled by manager"
+        await registry.update(experiment)
+        _write_result(experiment)
+    if cleanup_failed:
+        raise RuntimeError(f"Cancellation cleanup failed for {name}; keeping the registered experiment")
+    close_loggers(name)
+    await registry.remove(name)
+    _capacity.release(name)
+
+
+async def _remove_resources(experiment: Experiment) -> bool:
+    """Stop the remaining processes and resources. Return whether cleanup failed."""
+    name = experiment.experiment_name
     cleanup_failed = False
     try:  # kill only this experiment's subprocess (every stage tags --project-name)
         proc = await asyncio.create_subprocess_exec(
@@ -563,20 +612,7 @@ async def _cancel_and_remove(name: str) -> None:
         except Exception:
             cleanup_failed = True
             logger.exception("Failed to tear down environment for '%s'", name)
-    if experiment.status in _ACTIVE_STATUSES or cleanup_failed:
-        failed = cleanup_failed or getattr(experiment, "_restoration_failed", False)
-        experiment.status = ExperimentStatus.ERROR if failed else ExperimentStatus.CANCELLED
-        if cleanup_failed:
-            experiment.error = "Cancellation cleanup failed; see manager log"
-        elif not failed:
-            experiment.error = "Cancelled by manager"
-        await registry.update(experiment)
-        _write_result(experiment)
-    if cleanup_failed:
-        raise RuntimeError(f"Cancellation cleanup failed for {name}; keeping the registered experiment")
-    close_loggers(name)
-    await registry.remove(name)
-    _capacity.release(name)
+    return cleanup_failed
 
 
 async def _docker_preflight() -> Optional[str]:
